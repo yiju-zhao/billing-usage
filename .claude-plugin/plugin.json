@@ -1,6 +1,6 @@
 {
   "name": "billing-usage",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": { "name": "yiju-zhao" },
   "description": "Per-day (UTC) Claude Code token usage and API-list-price equivalent cost for a billing cycle, summed from local session transcripts on this device or any device reachable over ssh"
 }

@@ -169,6 +169,27 @@ def run_device(dev, a, start, end):
         return None, str(e) or type(e).__name__
 
 
+# (text found in the error, what to do about it); the first match wins.
+HINTS = (
+    ("Host key verification failed", "run `ssh {target}` yourself once and answer yes to trust the host key"),
+    ("Permission denied", "key login was rejected: check `user` and `identity_file`, or install your public key there"),
+    ("Connection refused", "no ssh server is listening: turn on sshd there (macOS: System Settings > General > Sharing > Remote Login)"),
+    ("Could not resolve hostname", "check `address`"),
+    ("No route to host", "the device is offline or not on this network"),
+    ("Network is unreachable", "the device is offline or not on this network"),
+    ("timed out", "the device may be asleep or offline; retry, or raise --timeout if it is only slow"),
+    ("command not found", "python3 is missing there: install it, or set `python` for this device"),
+)
+
+
+def hint_for(dev, error):
+    target = f"{dev['user']}@{dev['address']}" if dev.get("user") else dev.get("address", dev["name"])
+    for needle, hint in HINTS:
+        if needle in error:
+            return hint.format(target=target)
+    return None
+
+
 def merge_days(day_maps):
     out = collections.defaultdict(lambda: dict.fromkeys(BUCKET_KEYS, 0))
     for days in day_maps:
@@ -249,9 +270,12 @@ def main():
     if len(devices) > 1:
         print_devices(devices, outcomes)
 
-    failed = [f"{d['name']} ({err})" for d, (_, err) in zip(devices, outcomes) if err]
+    failed = [(d, err) for d, (_, err) in zip(devices, outcomes) if err]
     if failed:
-        print(f"\nWARNING: totals exclude {len(failed)} unreachable device(s): {'; '.join(failed)}")
+        print(f"\nWARNING: totals exclude {len(failed)} unreachable device(s):")
+        for d, err in failed:
+            hint = hint_for(d, err)
+            print(f"  {d['name']}: {err}" + (f"\n    fix: {hint}" if hint else ""))
     unpriced = sorted({m for r in results for m in r["unpriced"]})
     if unpriced:
         print(f"\nWARNING: no price for {', '.join(unpriced)}; their tokens are counted but cost is 0.")
