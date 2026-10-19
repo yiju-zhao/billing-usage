@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
-"""Sum Claude Code token usage and list-price API cost per UTC day from local transcripts.
+"""Sum Claude Code token usage and list-price API cost per UTC day, across one or more devices.
 
-Reads <config dir>/projects/**/*.jsonl (subagent transcripts included). A request is
-written to the transcript several times while it streams, so rows are deduplicated by
-(message.id, requestId); the row with the largest output_tokens wins and the earliest
-timestamp is the request's day. Scope: this machine and this config dir only.
+Each device is summarised from <config dir>/projects/**/*.jsonl (subagent transcripts
+included). A request is written to the transcript several times while it streams, so rows
+are deduplicated by (message.id, requestId); the row with the largest output_tokens wins and
+the earliest timestamp is the request's day. Devices come from a devices file (see
+devices.example.json): "local" reads this machine, "ssh" runs this same script on the device
+and reads back one line of JSON. Duplicates are removed per device, not across devices.
 """
 import argparse
 import collections
+import concurrent.futures
 import glob
 import json
 import os
+import shlex
+import socket
+import subprocess
 from datetime import datetime, timedelta, timezone
 
 FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+BUCKET_KEYS = ("requests", "cost") + FIELDS
+DEFAULT_DEVICES_FILE = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "billing-usage", "devices.json")
+SSH_CONNECT_TIMEOUT = 10
 
 # USD per million tokens: (input, cache write 5m, cache write 1h, cache read, output).
 # Source: platform.claude.com/docs/en/about-claude/pricing, read 2026-10-19. A model missing
@@ -72,7 +82,7 @@ def collect(projects_dir, start, end):
 
 
 def tally_by_day(rows):
-    out = collections.defaultdict(lambda: dict.fromkeys(("requests", "cost") + FIELDS, 0))
+    out = collections.defaultdict(lambda: dict.fromkeys(BUCKET_KEYS, 0))
     for ts, usage, model in rows:
         bucket = out[f"{ts:%Y-%m-%d}"]
         bucket["requests"] += 1
@@ -82,23 +92,126 @@ def tally_by_day(rows):
     return dict(sorted(out.items()))
 
 
-def print_table(buckets):
-    print(f"{'day (UTC)':<14}{'requests':>9}{'input':>12}{'output':>12}{'cache_write':>14}{'cache_read':>15}"
-          f"{'in+out':>12}{'all':>16}{'cost_usd':>12}")
-    total = dict.fromkeys(("requests", "cost") + FIELDS, 0)
-    for name, b in buckets.items():
-        for k in total:
-            total[k] += b[k]
-        _print_row(name, b)
-    _print_row("TOTAL", total)
+def summarize(config_dir, start, end):
+    """One device's result: the JSON a remote run prints and a local run uses directly."""
+    rows = collect(os.path.join(config_dir, "projects"), start, end)
+    return {
+        "days": tally_by_day(rows),
+        "unpriced": sorted({str(r[2]) for r in rows if r[2] not in PRICES}),
+        "premium": sum(1 for r in rows if r[1].get("speed") == "fast" or r[1].get("inference_geo") == "us"),
+    }
 
 
-def _print_row(name, b):
+def load_devices(path):
+    """Devices from the file at `path`; this machine alone when the default file is absent."""
+    explicit = path is not None
+    path = os.path.expanduser(path or DEFAULT_DEVICES_FILE)
+    if not os.path.exists(path):
+        if explicit:
+            raise SystemExit(f"devices file not found: {path}")
+        return [{"name": socket.gethostname(), "method": "local"}]
+    try:
+        with open(path) as f:
+            devices = json.load(f)["devices"]
+    except (ValueError, KeyError, TypeError) as e:
+        raise SystemExit(f'{path}: expected {{"devices": [...]}} ({type(e).__name__}: {e})')
+    names = set()
+    for i, d in enumerate(devices):
+        name, method = d.get("name"), d.get("method")
+        if not name or name in names:
+            raise SystemExit(f"{path}: device #{i + 1} needs a unique name")
+        names.add(name)
+        if method not in ("local", "ssh"):
+            raise SystemExit(f'{path}: device "{name}" has method {method!r}; use "local" or "ssh"')
+        if method == "ssh" and not d.get("address"):
+            raise SystemExit(f'{path}: ssh device "{name}" needs an address')
+    if not devices:
+        raise SystemExit(f"{path}: no devices listed")
+    return devices
+
+
+def run_ssh(dev, a):
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}"]
+    if dev.get("port"):
+        ssh += ["-p", str(dev["port"])]
+    if dev.get("identity_file"):
+        ssh += ["-i", os.path.expanduser(dev["identity_file"])]
+    target = f"{dev['user']}@{dev['address']}" if dev.get("user") else dev["address"]
+    remote = [dev.get("python", "python3"), "-", "--json", "--start", a.start]
+    if a.end:
+        remote += ["--end", a.end]
+    if dev.get("config_dir"):
+        remote += ["--config-dir", dev["config_dir"]]
+    with open(os.path.abspath(__file__)) as f:
+        source = f.read()
+    proc = subprocess.run(ssh + [target, " ".join(shlex.quote(x) for x in remote)],
+                          input=source, capture_output=True, text=True, timeout=a.timeout)
+    if proc.returncode != 0:
+        lines = proc.stderr.strip().splitlines()
+        raise RuntimeError(lines[-1] if lines else f"ssh exited with status {proc.returncode}")
+    # Login banners can precede the output, so take the last line that looks like our JSON.
+    json_lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("{")]
+    if not json_lines:
+        raise RuntimeError("no JSON in the remote output (is python3 installed there?)")
+    return json.loads(json_lines[-1])
+
+
+def run_device(dev, a, start, end):
+    """(result, None) on success, (None, reason) when the device could not be read."""
+    try:
+        if dev["method"] == "local":
+            config_dir = os.path.expanduser(dev.get("config_dir") or a.config_dir)
+            return summarize(config_dir, start, end), None
+        return run_ssh(dev, a), None
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {a.timeout}s"
+    except Exception as e:  # one unreachable device must not hide the others
+        return None, str(e) or type(e).__name__
+
+
+def merge_days(day_maps):
+    out = collections.defaultdict(lambda: dict.fromkeys(BUCKET_KEYS, 0))
+    for days in day_maps:
+        for day, bucket in days.items():
+            for k, v in bucket.items():
+                out[day][k] += v
+    return dict(sorted(out.items()))
+
+
+def _row(name, b, status=None):
     io = b["input_tokens"] + b["output_tokens"]
     everything = io + b["cache_creation_input_tokens"] + b["cache_read_input_tokens"]
-    print(f"{name:<14}{b['requests']:>9,}{b['input_tokens']:>12,}{b['output_tokens']:>12,}"
-          f"{b['cache_creation_input_tokens']:>14,}{b['cache_read_input_tokens']:>15,}{io:>12,}{everything:>16,}"
-          f"{b['cost']:>12,.2f}")
+    line = (f"{name:<20}{b['requests']:>9,}{b['input_tokens']:>12,}{b['output_tokens']:>12,}"
+            f"{b['cache_creation_input_tokens']:>14,}{b['cache_read_input_tokens']:>15,}{io:>12,}{everything:>16,}"
+            f"{b['cost']:>12,.2f}")
+    return line + (f"  {status}" if status else "")
+
+
+def _header(first):
+    return (f"{first:<20}{'requests':>9}{'input':>12}{'output':>12}{'cache_write':>14}{'cache_read':>15}"
+            f"{'in+out':>12}{'all':>16}{'cost_usd':>12}")
+
+
+def _total(buckets):
+    total = dict.fromkeys(BUCKET_KEYS, 0)
+    for b in buckets:
+        for k in total:
+            total[k] += b[k]
+    return total
+
+
+def print_days(days):
+    print(_header("day (UTC)"))
+    for day, b in days.items():
+        print(_row(day, b))
+    print(_row("TOTAL", _total(days.values())))
+
+
+def print_devices(devices, outcomes):
+    print("\n" + _header("device"))
+    for dev, (result, error) in zip(devices, outcomes):
+        b = _total(result["days"].values()) if result else dict.fromkeys(BUCKET_KEYS, 0)
+        print(_row(dev["name"], b, "ok" if result else f"UNREACHABLE: {error}"))
 
 
 def main():
@@ -106,6 +219,9 @@ def main():
     p.add_argument("--start", required=True, help="first day of the billing cycle, YYYY-MM-DD (UTC)")
     p.add_argument("--end", help="last day to include, YYYY-MM-DD (UTC); default: now")
     p.add_argument("--config-dir", default=os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude")))
+    p.add_argument("--devices", help=f"devices file (default: {DEFAULT_DEVICES_FILE}, else this machine only)")
+    p.add_argument("--timeout", type=int, default=120, help="seconds to wait for each ssh device (default: 120)")
+    p.add_argument("--json", action="store_true", help="print this machine's summary as one JSON line (used over ssh)")
     a = p.parse_args()
 
     utc = timezone.utc
@@ -115,15 +231,31 @@ def main():
     else:
         end = datetime.now(utc)
 
-    rows = collect(os.path.join(a.config_dir, "projects"), start, end)
-    print(f"Window (UTC): {start:%Y-%m-%d %H:%M} .. {end:%Y-%m-%d %H:%M}, {len(rows):,} unique requests")
-    print("cost_usd = list-price API equivalent (standard speed, global inference), not what a subscription is billed.\n")
-    print_table(tally_by_day(rows))
+    if a.json:
+        print(json.dumps(summarize(os.path.expanduser(a.config_dir), start, end)))
+        return
 
-    unpriced = sorted({r[2] for r in rows if r[2] not in PRICES}, key=str)
+    devices = load_devices(a.devices)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(devices)) as pool:
+        outcomes = list(pool.map(lambda d: run_device(d, a, start, end), devices))
+    results = [r for r, _ in outcomes if r]
+
+    days = merge_days(r["days"] for r in results)
+    requests = sum(b["requests"] for b in days.values())
+    scope = f" across {len(results)} of {len(devices)} devices" if len(devices) > 1 else ""
+    print(f"Window (UTC): {start:%Y-%m-%d %H:%M} .. {end:%Y-%m-%d %H:%M}, {requests:,} unique requests{scope}")
+    print("cost_usd = list-price API equivalent (standard speed, global inference), not what a subscription is billed.\n")
+    print_days(days)
+    if len(devices) > 1:
+        print_devices(devices, outcomes)
+
+    failed = [f"{d['name']} ({err})" for d, (_, err) in zip(devices, outcomes) if err]
+    if failed:
+        print(f"\nWARNING: totals exclude {len(failed)} unreachable device(s): {'; '.join(failed)}")
+    unpriced = sorted({m for r in results for m in r["unpriced"]})
     if unpriced:
-        print(f"\nWARNING: no price for {', '.join(map(str, unpriced))}; their tokens are counted but cost is 0.")
-    premium = sum(1 for r in rows if r[1].get("speed") == "fast" or r[1].get("inference_geo") == "us")
+        print(f"\nWARNING: no price for {', '.join(unpriced)}; their tokens are counted but cost is 0.")
+    premium = sum(r["premium"] for r in results)
     if premium:
         print(f"\nWARNING: {premium:,} requests used fast mode or US-only inference (cost understated).")
 

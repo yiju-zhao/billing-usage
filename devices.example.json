@@ -1,0 +1,15 @@
+{
+  "devices": [
+    { "name": "this-machine", "method": "local" },
+    {
+      "name": "dev-box",
+      "method": "ssh",
+      "address": "100.64.0.10",
+      "user": "alice",
+      "port": 22,
+      "identity_file": "~/.ssh/id_ed25519",
+      "python": "python3",
+      "config_dir": "~/.claude"
+    }
+  ]
+}
