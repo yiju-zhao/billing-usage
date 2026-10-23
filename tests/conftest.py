@@ -3,6 +3,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 import pytest
 
@@ -81,3 +82,13 @@ def local_devices_file(tmp_path):
     path = tmp_path / "devices.json"
     path.write_text(json.dumps({"devices": [{"name": "this-machine", "method": "local"}]}))
     return str(path)
+
+
+@pytest.fixture
+def tz_new_york(monkeypatch):
+    """Run the test with the process's local timezone set to America/New_York, then put it back."""
+    with monkeypatch.context() as patch:
+        patch.setenv("TZ", "America/New_York")
+        time.tzset()
+        yield
+    time.tzset()  # monkeypatch has restored TZ by now; make libc re-read it
