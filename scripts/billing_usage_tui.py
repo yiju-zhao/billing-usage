@@ -98,9 +98,10 @@ class UsageApp(App):
     ENABLE_COMMAND_PALETTE = False
     AUTO_FOCUS = None  # no word lit up at start; Tab reaches the first one
     BINDINGS = [
-        Binding("r", "refresh_now", "刷新", show=False),
-        Binding("q", "quit", "退出", show=False),
-        Binding("c", "cycle_day", "周期", show=False),
+        # priority: they work even with a date input focused (those only take digits and "-")
+        Binding("r", "refresh_now", "刷新", show=False, priority=True),
+        Binding("q", "quit", "退出", show=False, priority=True),
+        Binding("c", "cycle_day", "周期", show=False, priority=True),
         Binding("plus,equals_sign", "chart('zoom', 0.5)", "放大", show=False),
         Binding("minus", "chart('zoom', 2.0)", "缩小", show=False),
         Binding("left", "chart('pan_or_move', -1)", "左", show=False),
@@ -454,6 +455,7 @@ class UsageApp(App):
             dates.set_message("日期无效", error=True)
             return
         dates.set_message("")
+        dates.release()  # so r, c and the chart keys reach the app again
         self._pending_custom[section] = False
         self.state[section]["range"] = "custom"
         self.state[section]["start"], self.state[section]["end"] = message.start, message.end
@@ -464,11 +466,19 @@ class UsageApp(App):
         self._refetch_if_needed()
 
     def action_cycle_day(self) -> None:
+        if any(isinstance(screen, CycleDayScreen) for screen in self.screen_stack):
+            return  # `c` is a priority key, so it also arrives while the dialog is open
+
         def chosen(day: Optional[int]) -> None:
             if day is None:
                 return
             self.state["cycle_start_day"] = day
             self._save()
+            if self._refreshed and self._refresh_error is None:  # the status line follows the new cycle
+                try:
+                    write_summary(self.results, self.state, now_ms())
+                except OSError:
+                    pass
             self.render_all()
             self._refetch_if_needed()
 

@@ -340,6 +340,29 @@ def test_load_cached_ignores_damaged_files(content):
     assert res.rows == [] and res.last_ok_ms is None and not res.ok
 
 
+@pytest.mark.parametrize("damage", [
+    {"drop": "t"}, {"drop": "cost"}, {"drop": "input"}, {"drop": "model"}, {"t": "5"}, {"t": True}, {"t": 1.5},
+    {"cost": "1"}, {"cost": True}, {"output": None}, {"cache_read": "4"}, {"effort": None}, {"premium": 0},
+])
+def test_load_cached_discards_a_file_with_a_bad_row(damage):
+    good = dict(row(), device="a")
+    bad = dict(good)
+    if "drop" in damage:
+        del bad[damage["drop"]]
+    else:
+        bad.update(damage)
+    atomic_write_json(cache_dir() / "rows-a.json", {"fetched_at": T0, "rows": [good, bad], "unpriced": []})
+    (res,) = load_cached([LOCAL])
+    assert res.rows == [] and res.last_ok_ms is None
+
+
+def test_load_cached_keeps_unpriced_and_float_rows():
+    rows = [dict(row(cost=None), device="a"), dict(row(cost=2), device="a"), dict(row(input=1.0), device="a")]
+    atomic_write_json(cache_dir() / "rows-a.json", {"fetched_at": T0, "rows": rows, "unpriced": []})
+    (res,) = load_cached([LOCAL])
+    assert res.rows == rows and res.last_ok_ms == T0
+
+
 def test_a_damaged_cache_is_no_fallback_either():
     cache_dir().mkdir(parents=True)
     (cache_dir() / "rows-b.json").write_text("{not json")

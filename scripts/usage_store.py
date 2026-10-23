@@ -160,13 +160,36 @@ def _tag(rows: List[Row], name: str) -> List[Row]:
     return [dict(r, device=name) for r in rows]
 
 
+_TEXT_KEYS = ("model", "effort", "project", "skill")
+_TOKEN_KEYS = ("input", "output", "cache_write", "cache_write_1h", "cache_read")
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _row_ok(r: Any) -> bool:
+    """`r` has every key of the row shape with a type the TUI can use (`t` an int, numbers for the token
+    fields, `cost` a number or None)."""
+    if not isinstance(r, dict):
+        return False
+    try:
+        t, cost, premium = r["t"], r["cost"], r["premium"]
+        return (isinstance(t, int) and not isinstance(t, bool) and (cost is None or _number(cost))
+                and isinstance(premium, bool) and all(isinstance(r[k], str) for k in _TEXT_KEYS)
+                and all(_number(r[k]) for k in _TOKEN_KEYS))
+    except KeyError:
+        return False
+
+
 def _read_cache(name: str):
-    """(rows, unpriced, fetched_at_ms) from the device's cache file, or None when it is missing or damaged."""
+    """(rows, unpriced, fetched_at_ms) from the device's cache file, or None when it is missing or damaged;
+    one row the TUI could not use makes the whole file count as damaged."""
     data = _read_json(_cache_file(name))
     if not isinstance(data, dict):
         return None
     rows, fetched_at, unpriced = data.get("rows"), data.get("fetched_at"), data.get("unpriced", [])
-    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+    if not isinstance(rows, list) or not all(_row_ok(r) for r in rows):
         return None
     if isinstance(fetched_at, bool) or not isinstance(fetched_at, int):
         return None

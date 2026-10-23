@@ -140,32 +140,67 @@ def test_build_chart_without_rows():
 # ---------------------------------------------------------------- geometry and labels
 
 def test_bar_geometry():
-    assert bar_geometry(10, 60, 9) == (0, 10, 6, 5)  # 6 columns per bucket: a 5-wide bar and a gap
-    assert bar_geometry(20, 60, 19) == (0, 20, 3, 2)
-    assert bar_geometry(30, 60, 29) == (0, 30, 2, 2)  # a gap would leave one column: no gap
-    assert bar_geometry(100, 60, 99) == (40, 60, 1, 1)  # the latest buckets show
-    assert bar_geometry(100, 60, 10) == (10, 60, 1, 1)  # until the highlight goes further back
-    assert bar_geometry(0, 60, 0) == (0, 0, 0, 0)
+    g = bar_geometry(10, 60, 9)  # 6 columns per bucket: a 5-wide bar and a 1-column gap
+    assert (g.first, g.count, g.bar, g.width) == (0, 10, 5, 60) and g.xs == tuple(range(0, 60, 6))
+    g = bar_geometry(20, 60, 19)
+    assert (g.first, g.count, g.bar, g.width) == (0, 20, 2, 60) and g.xs == tuple(range(0, 60, 3))
+    g = bar_geometry(30, 60, 29)  # under 3 columns a bucket: no gap is kept
+    assert (g.first, g.count, g.bar, g.width) == (0, 30, 2, 60) and g.xs == tuple(range(0, 60, 2))
+    g = bar_geometry(42, 113, 41)  # 2.69 columns a bucket: bars 2 wide, the gaps fall where they fall
+    assert g.bar == 2 and g.xs == tuple(k * 113 // 42 for k in range(42)) and g.width == 113
+    g = bar_geometry(45, 60, 44)  # under 2 columns a bucket: one column each, as many as there are
+    assert (g.first, g.count, g.bar, g.width) == (0, 45, 1, 45) and g.xs == tuple(range(45))
+    g = bar_geometry(100, 60, 99)  # the latest buckets show
+    assert (g.first, g.count, g.bar, g.width) == (40, 60, 1, 60) and g.xs == tuple(range(60))
+    assert bar_geometry(100, 60, 10).first == 10  # until the highlight goes further back
+    g = bar_geometry(0, 60, 0)
+    assert (g.first, g.count, g.xs, g.bar, g.width) == (0, 0, (), 0, 0)
+
+
+@pytest.mark.parametrize("n,cols", [(42, 113), (42, 84), (42, 95), (42, 127), (42, 153), (42, 200), (7, 100),
+                                    (10, 35), (31, 113), (24, 113), (90, 200), (3, 7), (1, 50), (12, 25)])
+def test_bars_fill_the_plot_in_a_regular_rhythm(n, cols):
+    g = bar_geometry(n, cols, n - 1)
+    assert g.count == n and g.width == cols and len(g.xs) == n and g.xs[0] == 0
+    assert g.bar == max(1, cols // n - (1 if cols / n >= 3 else 0))  # one width for every bar
+    ends = [x + g.bar for x in g.xs]
+    assert cols - 2 <= ends[-1] <= cols  # the last bar ends within 2 columns of the right edge
+    for x, end, nxt in zip(g.xs, ends, g.xs[1:]):
+        assert end <= nxt  # bars never overlap
+        if cols / n >= 3:
+            assert end < nxt  # nor touch
+    gaps = {nxt - end for end, nxt in zip(ends, g.xs[1:])}
+    assert max(gaps or {0}) - min(gaps or {0}) <= 1  # the gaps alternate between two widths at most
 
 
 def test_x_labels_dates_for_a_week_and_times_for_a_day():
     day = local_ms(2026, 10, 16)
     starts = bucket_starts(day, day + 7 * DAY_MS, 4 * H)
-    labels = x_labels(starts, starts[-1] + 4 * H, 0, 42, 2, 2, 4 * H, 84)
+    labels = x_labels(starts, starts[-1] + 4 * H, bar_geometry(42, 84, 41), 4 * H)
     assert [text for _, text in labels] == ["10/%d" % d for d in range(16, 23)]
     assert [col for col, _ in labels] == [12 * k for k in range(7)]
 
     starts = bucket_starts(day, day + DAY_MS, 30 * MINUTE_MS)
-    labels = x_labels(starts, day + DAY_MS, 0, 48, 2, 2, 30 * MINUTE_MS, 96)
+    labels = x_labels(starts, day + DAY_MS, bar_geometry(48, 96, 47), 30 * MINUTE_MS)
     assert labels[0] == (0, "10/16") and labels[1] == (8, "02:00")
     assert all(b[0] >= a[0] + len(a[1]) + 2 for a, b in zip(labels, labels[1:]))
     assert all(col + len(text) <= 96 for col, text in labels)
 
 
+def test_x_labels_sit_at_the_bars_when_the_spacing_is_fractional():
+    day = local_ms(2026, 10, 16)
+    starts = bucket_starts(day, day + 7 * DAY_MS, 4 * H)
+    g = bar_geometry(42, 113, 41)
+    labels = x_labels(starts, starts[-1] + 4 * H, g, 4 * H)
+    assert [text for _, text in labels] == ["10/%d" % d for d in range(16, 23)]
+    assert [col for col, _ in labels] == [g.xs[6 * k] for k in range(7)]
+    assert all(col + len(text) <= 113 for col, text in labels)
+
+
 def test_x_labels_leave_room_between_labels_when_bars_are_thin():
     day = local_ms(2026, 10, 1)
     starts = bucket_starts(day, day + 30 * DAY_MS, DAY_MS)
-    labels = x_labels(starts, day + 30 * DAY_MS, 0, 30, 1, 1, DAY_MS, 30)
+    labels = x_labels(starts, day + 30 * DAY_MS, bar_geometry(30, 30, 29), DAY_MS)
     assert len(labels) >= 2
     assert all(b[0] >= a[0] + len(a[1]) + 2 for a, b in zip(labels, labels[1:]))
 

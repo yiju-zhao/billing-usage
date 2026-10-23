@@ -17,7 +17,7 @@ from conftest import assistant, write_transcript  # noqa: E402
 from textual.widgets import Input, OptionList  # noqa: E402
 from rich.cells import cell_len  # noqa: E402
 from tui_timeline import BAND, Legend, Plot, TimelineChart, bucket_title  # noqa: E402
-from tui_widgets import BG, SentenceBar, ShareTable, share_table_lines  # noqa: E402
+from tui_widgets import BG, SentenceBar, ShareTable, fmt_metric, share_table_lines  # noqa: E402
 from usage_groups import GREY, aggregate  # noqa: E402
 from usage_time import GRANULARITIES  # noqa: E402
 from billing_usage_tui import granularity_label  # noqa: E402
@@ -791,7 +791,7 @@ def test_detail_box_sits_inside_the_plot_beside_the_bar_on_a_narrow_screen():
         assert app.query_one(ShareTable).region.height >= 2
         hit = plot.hit
         lines = text.splitlines()
-        x0 = hit.gutter + (chart.hl_index() - hit.first) * hit.slot
+        x0 = hit.gutter + hit.xs[chart.hl_index() - hit.first]
         box_cols = [ln.index("╭") for ln in lines if "╭" in ln]
         assert box_cols and (box_cols[0] > x0 or box_cols[0] + 20 < x0)  # beside the bar, not over it
     run(app, body, size=(70, 24))
@@ -804,7 +804,7 @@ def test_hover_highlights_a_bar_and_clicking_a_legend_entry_picks_it():
         chart = app.query_one(TimelineChart)
         plot = app.query_one(Plot)
         hit = plot.hit
-        await pilot.hover(Plot, offset=(hit.gutter + hit.slot - 1, hit.top))
+        await pilot.hover(Plot, offset=(hit.gutter + hit.xs[0] + hit.bar - 1, hit.top))
         await pilot.pause()
         assert chart.hl_ms is not None and chart.hl_index() == hit.first
         legend = app.query_one(Legend)
@@ -828,7 +828,7 @@ def test_mouse_wheel_zooms_around_the_bar_under_the_mouse():
     async def body(pilot):
         plot, chart = app.query_one(Plot), app.query_one(TimelineChart)
         hit = plot.hit
-        x, y = hit.gutter + 2 * hit.slot, hit.top + 1
+        x, y = hit.gutter + hit.xs[2], hit.top + 1
         under = chart.data.starts[hit.first + 2]
         plot.post_message(events.MouseScrollUp(plot, x, y, 0, 1, 0, False, False, False, screen_x=x, screen_y=y))
         await pilot.pause()
@@ -858,3 +858,220 @@ def test_100x30_keeps_chart_legend_detail_and_share_table_on_screen():
         title = text.splitlines()[0]
         assert "今日" in title and "r 刷新" in title
     run(app, body, size=(100, 30))
+
+
+# ---------------------------------------------------------------- bars across the whole plot
+
+def even_fetch(dev, start, end, timeout, config_dir):
+    """The same cost in every 4-hour bucket of the last week, so every bar is full height."""
+    return {"rows": [row(NOW - k * 4 * HOUR - 1000, "nasa718", 1.0) for k in range(7 * 6)], "unpriced": []}
+
+
+def bar_runs(line, plot_x0):
+    """(start, length) of each run of bar cells on one plot row, columns from `plot_x0`."""
+    runs, start = [], None
+    for x, (ch, _, _) in enumerate(line + [(" ", None, None)]):
+        if ch in BAR_GLYPHS and start is None:
+            start = x
+        elif ch not in BAR_GLYPHS and start is not None:
+            runs.append((start - plot_x0, x - start))
+            start = None
+    return runs
+
+
+@pytest.mark.parametrize("size", [(120, 40), (160, 40), (100, 30)])
+def test_bars_spread_over_the_whole_plot_in_one_width(size):
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=even_fetch)
+
+    async def body(pilot):
+        chart, plot = app.query_one(TimelineChart), app.query_one(Plot)
+        hit = plot.hit
+        n, cols = len(chart.data.starts), plot.size.width - hit.gutter
+        assert hit.count == n and hit.width == cols
+        bottom = cells_of(app, plot)[hit.bottom - 3]  # the lowest bar row, above the axis and its labels
+        runs = bar_runs(bottom, hit.gutter)
+        assert runs[0][0] == 0 and cols - (runs[-1][0] + runs[-1][1]) <= 2  # from the axis to the right edge
+        if cols / n >= 3:
+            assert len(runs) == n and {length for _, length in runs} == {hit.bar}  # apart, one width
+            assert [x for x, _ in runs] == list(hit.xs)
+        else:
+            assert sum(length for _, length in runs) == n * hit.bar
+        # the total sits over the middle of the plot, not of the bars' left part
+        top = widget_text(app, plot).splitlines()[0]
+        text = fmt_metric(chart.data.whole, "cost")
+        mid = top.index(" " + text + " ") + 1 + len(text) / 2
+        assert abs(mid - (hit.gutter + cols / 2)) <= 1
+        # the mouse finds a bar's bucket on every one of its columns
+        for j, x in enumerate(hit.xs):
+            for c in range(x, x + hit.bar):
+                assert plot._bucket_at(hit.gutter + c, hit.top) == hit.first + j
+        assert plot._bucket_at(hit.gutter - 1, hit.top) is None
+        assert plot._bucket_at(hit.gutter + cols, hit.top) is None
+    run(app, body, size=size)
+
+
+# ---------------------------------------------------------------- keys while typing dates
+
+def test_q_quits_while_a_custom_date_input_has_focus():
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=fake_fetch)
+
+    async def body(pilot):
+        app.post_message(SentenceBar.Changed("timeline", "range", "custom"))
+        await settle(app, pilot)
+        assert isinstance(app.focused, Input)
+        await pilot.press("x", "2", "-")  # only digits and dashes type into a date
+        assert app.focused.value == "2-"
+        await pilot.press("q")
+        await pilot.pause()
+        assert app.return_code == 0  # the app is exiting
+    run(app, body)
+
+
+def test_entering_dates_hands_focus_back_so_r_refreshes():
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=fake_fetch)
+    today = time.strftime("%Y-%m-%d", time.localtime(NOW / 1000))
+
+    async def body(pilot):
+        calls = []
+        app.action_refresh_now = lambda: calls.append(1)
+        app.post_message(SentenceBar.Changed("timeline", "range", "custom"))
+        await settle(app, pilot)
+        start, end = app.query("#timeline-dates Input").results(Input)
+        assert app.focused is start
+        await pilot.press(*"2026-01-01")
+        end.value = today
+        await pilot.press("enter")
+        await settle(app, pilot)
+        assert app.state["timeline"]["range"] == "custom" and app.state["timeline"]["start"] == "2026-01-01"
+        assert app.focused is app.query_one("#timeline-sentence", SentenceBar).word("range")
+        await pilot.press("r")
+        await pilot.pause()
+        assert calls == [1]
+    run(app, body)
+
+
+def test_escape_in_a_date_input_lets_go_of_it():
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=fake_fetch)
+
+    async def body(pilot):
+        app.post_message(SentenceBar.Changed("share", "range", "custom"))
+        await settle(app, pilot)
+        assert isinstance(app.focused, Input)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.focused, Input)
+        assert app.focused is app.query_one("#share-sentence", SentenceBar).word("range")
+    run(app, body)
+
+
+def test_keys_inside_the_cycle_day_dialog():
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=fake_fetch)
+
+    async def body(pilot):
+        await pilot.press("c")
+        await pilot.pause()
+        field = app.screen.query_one(Input)
+        await pilot.press("c")  # no second dialog over the first
+        await pilot.pause()
+        assert len(app.screen_stack) == 2 and app.screen.query_one(Input) is field
+        await pilot.press("backspace", "x", "1", "2")
+        assert field.value == "12"
+        await pilot.press("enter")
+        await settle(app, pilot)
+        assert app.state["cycle_start_day"] == 12 and len(app.screen_stack) == 1
+    run(app, body)
+
+
+# ---------------------------------------------------------------- share table focus
+
+def test_tab_skips_the_share_table_but_the_wheel_still_scrolls_it():
+    from textual import events
+    from textual.containers import VerticalScroll
+
+    def many(dev, start, end, timeout, config_dir):
+        return {"rows": [row(NOW - 1000 - i, "p%02d" % i, 1.0 + i) for i in range(30)], "unpriced": []}
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=many)
+
+    async def body(pilot):
+        app.query_one("#share-sentence", SentenceBar).word("range").focus()
+        await pilot.press("tab")
+        assert not isinstance(app.focused, VerticalScroll)
+        assert app.focused is app.query_one("#timeline-sentence", SentenceBar).word("metric")
+        scroll = app.query_one(ShareTable).query_one(VerticalScroll)
+        assert scroll.max_scroll_y > 0
+        x, y = 2, 1
+        scroll.post_message(events.MouseScrollDown(scroll, x, y, 0, 1, 0, False, False, False,
+                                                   screen_x=x, screen_y=y))
+        await pilot.pause()
+        await pilot.pause()
+        assert scroll.scroll_y > 0
+    run(app, body, size=(100, 30))
+
+
+# ---------------------------------------------------------------- cycle day and summary.json
+
+def test_a_new_cycle_day_rewrites_the_summary():
+    def spread(dev, start, end, timeout, config_dir):
+        return {"rows": [row(NOW - k * 24 * HOUR - 1000, "p", 1.0) for k in range(40)], "unpriced": []}
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=spread)
+    path = usage_store.cache_dir() / "summary.json"
+
+    async def body(pilot):
+        app._refetch_if_needed = lambda: None  # so only the choice itself can write the summary
+        before = json.loads(path.read_text())["cycle_cost"]
+        day = next(d for d in range(1, 29) if usage_store.today_and_cycle_cost(
+            app._all_rows(), d, NOW)[1] != before)
+        await pilot.press("c")
+        await pilot.pause()
+        app.screen.query_one(Input).value = str(day)
+        await pilot.press("enter")
+        await settle(app, pilot)
+        assert app.state["cycle_start_day"] == day
+        assert json.loads(path.read_text())["cycle_cost"] != before
+    run(app, body)
+
+
+def test_a_new_cycle_day_leaves_the_summary_alone_after_a_failed_refresh():
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=fake_fetch)
+    path = usage_store.cache_dir() / "summary.json"
+
+    async def body(pilot):
+        app._refresh_error = "boom"
+        mtime = path.stat().st_mtime_ns
+        await pilot.press("c")
+        await pilot.pause()
+        app.screen.query_one(Input).value = "3"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.state["cycle_start_day"] == 3 and path.stat().st_mtime_ns == mtime
+    run(app, body)
+
+
+# ---------------------------------------------------------------- legend order
+
+def test_legend_is_largest_first_while_the_bars_keep_their_stack_order():
+    def fetch(dev, start, end, timeout, config_dir):
+        return {"rows": [row(NOW - 2 * HOUR, "p", 1.0), row(NOW - 2 * HOUR, "p", 3.0, effort="xhigh"),
+                         row(NOW - 2 * HOUR, "p", 6.0, model="claude-sonnet-5-5")], "unpriced": []}
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=fetch)
+    opus, xhigh, sonnet = "claude-opus-5-5\thigh", "claude-opus-5-5\txhigh", "claude-sonnet-5-5\thigh"
+
+    async def body(pilot):
+        chart = app.query_one(TimelineChart)
+        assert [s.key for s in chart.data.segs] == [opus, xhigh, sonnet]  # stack order, bottom up
+        legend = app.query_one(Legend)
+        assert [key for _, _, _, key in legend.hits] == [sonnet, xhigh, opus]
+        text = widget_text(app, legend)
+        assert text.index("sonnet-5-5 high 60%") < text.index("opus-5-5 xhigh 30%") < text.index("opus-5-5 high 10%")
+        grid = cells_of(app, app.query_one(Plot))
+        hit = app.query_one(Plot).hit
+        col = hit.gutter + hit.xs[bisect.bisect_right(chart.data.starts, NOW - 2 * HOUR) - 1 - hit.first]
+        assert grid[hit.bottom - 3][col][1] == OPUS_HIGH  # the bar's bottom is still opus high
+        picked = []
+        for _ in range(3):
+            await pilot.press("down")
+            picked.append(chart.legend_key)
+        assert picked == [sonnet, xhigh, opus]
+        await pilot.press("up")
+        assert chart.legend_key == xhigh
+    run(app, body)

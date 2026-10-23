@@ -10,6 +10,7 @@ leaves, the wheel zooms, hovering or clicking a legend entry picks it.
 
 What to draw is decided by pure functions of rows and numbers (render_bars, build_chart, bar_geometry,
 x_labels, zoom_window, pan_window, bucket_detail, bucket_title, legend_lines); the widgets only lay them out.
+The legend lists the segments largest first; the bars stack them in their own order.
 """
 from __future__ import annotations
 
@@ -213,35 +214,46 @@ def build_chart(rows: List[dict], by: str, metric: str, picked_ms: int, range_to
 
 # ---------------------------------------------------------------- geometry, labels, zoom
 
-def bar_geometry(n: int, cols: int, hl: int) -> Tuple[int, int, int, int]:
-    """`(first, count, slot, bar)`: the leftmost bucket shown, how many show, the columns each one gets and
-    the bar's width in them (the rest is a gap on its left). Fewer buckets than columns: ⌊cols/n⌋ each, with a
-    1-column gap when that leaves a bar 2 or more wide. More: one column each, the latest ones showing unless
-    the highlight `hl` is further back."""
+class Geometry(NamedTuple):
+    """Where the bars go on a plot `cols` wide. Bucket `first + j` owns the columns from `xs[j]` up to the next
+    bucket's (or `width`); its bar fills the first `bar` of them and the rest is the gap after it."""
+    first: int  # the leftmost bucket shown
+    count: int  # how many show
+    xs: Tuple[int, ...]  # each shown bucket's first column
+    bar: int  # every bar's width
+    width: int  # the columns the shown buckets span (the axis's length)
+    pitch: float  # columns per bucket
+
+
+def bar_geometry(n: int, cols: int, hl: int) -> Geometry:
+    """The bars spread over the whole plot as token-meter places them: bucket k starts at ⌊k·cols/n⌋ and every
+    bar is ⌊cols/n⌋ wide, less a column of gap from 3 columns a bucket up, so the gaps keep a regular rhythm.
+    Under 2 columns a bucket: one column each, the latest ones showing unless the highlight `hl` is further
+    back."""
     if n <= 0 or cols <= 0:
-        return 0, 0, 0, 0
-    if n <= cols:
-        slot = cols // n
-        return 0, n, slot, slot - 1 if slot - 1 >= 2 else slot
-    first = min(n - cols, max(0, hl))
-    return first, cols, 1, 1
+        return Geometry(0, 0, (), 0, 0, 0.0)
+    if cols < 2 * n:
+        count = min(n, cols)
+        first = min(n - count, max(0, hl))
+        return Geometry(first, count, tuple(range(count)), 1, count, 1.0)
+    bar = max(1, cols // n - (1 if cols >= 3 * n else 0))
+    return Geometry(0, n, tuple(k * cols // n for k in range(n)), bar, cols, cols / n)
 
 
 def _midnight(t_ms: int) -> int:
     return bucket_start(t_ms, DAY_MS)
 
 
-def x_labels(starts: List[int], end_ms: int, first: int, count: int, slot: int, bar: int, g: int,
-             width: int) -> List[Tuple[int, str]]:
-    """`(column, text)` labels under the bars shown: dates (`10/16`) at midnights when the view spans two days
-    or more or the buckets are days, `HH:MM` at round times otherwise (a midnight still shows its date). The
-    step is the finest that keeps two cells between labels."""
-    if count <= 0 or slot <= 0:
+def x_labels(starts: List[int], end_ms: int, geo: Geometry, g: int) -> List[Tuple[int, str]]:
+    """`(column, text)` labels under the bars `geo` shows, each at its bar's first column: dates (`10/16`) at
+    midnights when the view spans two days or more or the buckets are days, `HH:MM` at round times otherwise
+    (a midnight still shows its date). The step is the finest that keeps two cells between labels."""
+    first, count, xs, width = geo.first, geo.count, geo.xs, geo.width
+    if count <= 0:
         return []
     shown = starts[first:first + count]
     span_end = starts[first + count] if first + count < len(starts) else end_ms
-    offset = slot - bar
-    per_bucket = slot  # columns per bucket
+    per_bucket = geo.pitch  # columns per bucket
     need = 5 + LABEL_GAP
     candidates: List[Tuple[int, str]] = []
     if g >= DAY_MS or span_end - shown[0] >= 2 * DAY_MS:
@@ -257,7 +269,7 @@ def x_labels(starts: List[int], end_ms: int, first: int, count: int, slot: int, 
             else:
                 keep = day.tm_mday == 1 and (day.tm_mon - 1) % months == 0
             if keep:
-                candidates.append((k * slot + offset, time.strftime("%m/%d", day)))
+                candidates.append((xs[k], time.strftime("%m/%d", day)))
     else:
         steps = [m * MINUTE_MS for m in (1, 2, 5, 10, 15, 30, 60, 120, 180, 240, 360, 720, 1440)]
         step = next((s for s in steps if s >= g and s % g == 0 and s / g * per_bucket >= need), DAY_MS)
@@ -265,7 +277,7 @@ def x_labels(starts: List[int], end_ms: int, first: int, count: int, slot: int, 
             m = _midnight(s)
             if (s - m) % step == 0:
                 text = time.strftime("%m/%d" if s == m else "%H:%M", time.localtime(s / 1000))
-                candidates.append((k * slot + offset, text))
+                candidates.append((xs[k], text))
     labels: List[Tuple[int, str]] = []
     for col, text in candidates:
         if col + cell_len(text) > width:
@@ -274,7 +286,7 @@ def x_labels(starts: List[int], end_ms: int, first: int, count: int, slot: int, 
             continue
         labels.append((col, text))
     if not labels and cell_len(time.strftime("%m/%d", time.localtime(shown[0] / 1000))) <= width:
-        labels.append((offset, time.strftime("%m/%d", time.localtime(shown[0] / 1000))))
+        labels.append((xs[0], time.strftime("%m/%d", time.localtime(shown[0] / 1000))))
     return labels
 
 
@@ -363,7 +375,9 @@ class Hit(NamedTuple):
     gutter: int  # columns left of the bars
     first: int
     count: int
-    slot: int
+    xs: Tuple[int, ...]  # as Geometry's
+    bar: int
+    width: int
 
 
 def _style(fg: Optional[str], bg: Optional[str]) -> str:
@@ -387,8 +401,8 @@ class Plot(Widget):
         if hit is None or not hit.top <= y < hit.bottom:
             return None
         col = x - hit.gutter
-        if 0 <= col < hit.count * hit.slot:
-            return hit.first + col // hit.slot
+        if 0 <= col < hit.width:  # a gap column belongs to the bar on its left
+            return hit.first + bisect.bisect_right(hit.xs, col) - 1
         return None
 
     def on_mouse_move(self, event: events.MouseMove) -> None:
@@ -427,7 +441,7 @@ class Legend(Widget):
     def _entries(self) -> List[Tuple[Group, str, str]]:
         d = self.chart.data
         return [(s, _fit(s.label, LEGEND_LABEL_MAX), fmt_pct(s.value(self.chart.metric), d.whole))
-                for s in d.segs]
+                for s in self.chart.legend_order()]
 
     def layout_lines(self, width: int, chart_height: int) -> Tuple[List[List[Tuple[str, int]]], int]:
         """The wrapped entries in at most the lines that leave the plot PLOT_MIN of the chart's rows, and how
@@ -629,8 +643,13 @@ class TimelineChart(Vertical):
             self.hl_ms = min(max(self.hl_ms, new[0]), new[1] - 1)
         self.window = new
 
+    def legend_order(self) -> List[Group]:
+        """The segments as the legend lists them: largest share of the metric first (the bars keep stack
+        order); ties keep stack order."""
+        return sorted(self.data.segs, key=lambda s: -s.value(self.metric))
+
     def step_legend(self, step: int) -> None:
-        keys = [s.key for s in self.data.segs]
+        keys = [s.key for s in self.legend_order()]
         if not keys:
             return
         at = keys.index(self.legend_key) if self.legend_key in keys else (-1 if step > 0 else len(keys))
@@ -692,28 +711,31 @@ class TimelineChart(Vertical):
         vmax = nice_max(self._peak(drawn))
         y_label = fmt_metric(vmax, self.metric)
         gutter = cell_len(y_label) + 1
-        first, count, slot, bar = bar_geometry(len(d.starts), max(1, width - gutter), hl)
-        bars_w = count * slot  # the axis ends with the last bar
-        offset = slot - bar
+        cols = max(1, width - gutter)
+        geo = bar_geometry(len(d.starts), cols, hl)
+        first, count, xs, bar = geo.first, geo.count, geo.xs, geo.bar
+        bars_w = geo.width  # the axis ends with the last bucket
         stacks = [[(d.values.get(i, {}).get(s.key, 0.0), colors[s.key]) for s in drawn]
                   for i in range(first, first + count)]
         cells = render_bars(stacks, bars_h, vmax)
+        # the bucket each column belongs to, and whether it is inside that bucket's bar or its gap
+        owner = [bisect.bisect_right(xs, c) - 1 for c in range(bars_w)]
         lit = self.hl_ms is not None and first <= hl < first + count
-        hl_cols = range((hl - first) * slot + offset, (hl - first + 1) * slot) if lit else range(0)
+        hl_cols = range(xs[hl - first], xs[hl - first] + bar) if lit else range(0)
 
         lines: List[Text] = []
         if top_rows:
-            lines.append(self._top_line(width, gutter, bars_w))
+            lines.append(self._top_line(width, gutter, cols))
         for r in range(bars_h):
             if r == 0:
                 line = Text(_pad(y_label, gutter - 1, right=True) + "┤", style=MUTED)
             else:
                 line = Text(" " * (gutter - 1) + "│", style=RULE)
             for c in range(bars_w):
-                k, within = divmod(c, slot)
+                k = owner[c]
                 band = BAND if c in hl_cols else None
-                if within < offset:
-                    line.append(" ", style=_style(None, band))
+                if c - xs[k] >= bar:
+                    line.append(" ")
                 else:
                     glyph, fg, bg = cells[r][k]
                     line.append(glyph, style=_style(fg, bg or band))
@@ -726,14 +748,15 @@ class TimelineChart(Vertical):
         if label_rows:
             line = Text(" " * gutter)
             end = d.ends[first + count - 1]
-            for col, text in x_labels(d.starts, end, first, count, slot, bar, d.g, bars_w):
+            for col, text in x_labels(d.starts, end, geo, d.g):
                 line.append(" " * (gutter + col - line.cell_len))
                 line.append(text, style=BRIGHT if col in hl_cols else MUTED)
             lines.append(line)
         if lit:
-            bar_x = gutter + (hl - first) * slot + offset
-            self._overlay_detail(lines, top_rows, width, bar_x, gutter + (hl - first + 1) * slot)
-        plot.hit = Hit(top_rows, top_rows + bars_h + axis_rows + label_rows, gutter, first, count, slot)
+            bar_x = gutter + xs[hl - first]
+            self._overlay_detail(lines, top_rows, width, bar_x, bar_x + bar)
+        plot.hit = Hit(top_rows, top_rows + bars_h + axis_rows + label_rows, gutter, first, count, xs, bar,
+                       bars_w)
         return lines
 
     def _overlay_detail(self, lines: List[Text], top: int, width: int, bar_x0: int, bar_x1: int) -> None:
@@ -770,14 +793,14 @@ class TimelineChart(Vertical):
                 line.append(" " * (x + box_w - line.cell_len))
             lines[top + j] = Text.assemble(line[:x], row, line[x + box_w:])
 
-    def _top_line(self, width: int, gutter: int, bars_w: int) -> Text:
-        """The range's total (or the shown segment's) centred over the bars; on its left the picked or shown
+    def _top_line(self, width: int, gutter: int, plot_w: int) -> Text:
+        """The range's total (or the shown segment's) centred over the plot; on its left the picked or shown
         segment's value and share, or the zoomed window; the key hints on the right."""
         d = self.data
         segs = {s.key: s for s in d.segs}
         only = segs.get(self.only) if self.only else None
         total_text = fmt_metric(only.value(self.metric) if only else d.whole, self.metric)
-        start = max(0, gutter + (bars_w - cell_len(total_text)) // 2)
+        start = max(0, gutter + (plot_w - cell_len(total_text)) // 2)
         left = Text()
         shown = only or segs.get(self.focus_key)
         if shown is not None:

@@ -42,6 +42,8 @@ GAP = 2
 NAME_HEADS = {"model": "模型", "project": "项目", "device": "设备", "skill": "skill"}
 
 Choice = Tuple  # (value, label) or (value, label, note); a note disables the option and says why
+DIGITS = "0123456789"
+DATE_CHARS = DIGITS + "-"
 
 
 def fmt_metric(value: float, metric: str) -> str:
@@ -196,9 +198,11 @@ class ShareTable(Vertical):
         self._lines: List[Text] = []
 
     def compose(self) -> ComposeResult:
+        scroll = VerticalScroll()
+        scroll.can_focus = False  # the wheel scrolls it; Tab only stops at the words
         with Vertical():
             yield TableHead(self)
-            with VerticalScroll():
+            with scroll:
                 yield TableBody(self)
 
     def update(self, groups: Sequence[Group], metric: str, by: str, total: float, grey: Iterable[str] = (),
@@ -390,8 +394,24 @@ class ChoiceScreen(ModalScreen):
 
 # ---------------------------------------------------------------- custom dates and the cycle day
 
+class CharInput(Input):
+    """An Input that types only the characters in `takes` (pass a matching `restrict`). Textual drops every
+    binding of a printable key, priority ones too, while an Input that may consume it has focus; claiming only
+    these characters lets q, r and c reach the app."""
+
+    def __init__(self, value: str = "", *, takes: str, **kwargs) -> None:
+        super().__init__(value, **kwargs)
+        self.takes = takes
+
+    def check_consume_key(self, key: str, character: Optional[str]) -> bool:
+        return character is not None and character in self.takes
+
+
 class DateRange(Horizontal):
-    """`从 [YYYY-MM-DD] 到 [YYYY-MM-DD]` under a sentence whose range is 自定义日期."""
+    """`从 [YYYY-MM-DD] 到 [YYYY-MM-DD]` under a sentence whose range is 自定义日期. Only digits and `-` type, so
+    the app's letter keys still work; Esc hands focus back to the sentence's range word."""
+
+    BINDINGS = [Binding("escape", "release", "离开", show=False)]
 
     DEFAULT_CSS = f"""
     DateRange {{ height: 1; padding: 0 1; display: none; color: {MUTED}; }}
@@ -416,9 +436,11 @@ class DateRange(Horizontal):
 
     def compose(self) -> ComposeResult:
         yield Static("从 ")
-        yield Input(self._start, placeholder="YYYY-MM-DD", max_length=10, classes="start")
+        yield CharInput(self._start, takes=DATE_CHARS, restrict=r"[0-9-]*", placeholder="YYYY-MM-DD",
+                        max_length=10, classes="start")
         yield Static(" 到 ")
-        yield Input(self._end, placeholder="YYYY-MM-DD", max_length=10, classes="end")
+        yield CharInput(self._end, takes=DATE_CHARS, restrict=r"[0-9-]*", placeholder="YYYY-MM-DD",
+                        max_length=10, classes="end")
         yield Static("", classes="message")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -429,6 +451,13 @@ class DateRange(Horizontal):
 
     def focus_start(self) -> None:
         self.call_after_refresh(self.query_one(".start", Input).focus)
+
+    def release(self) -> None:
+        """Move focus from the inputs to the section's range word (`<section>-range`)."""
+        self.screen.query_one(f"#{self.section}-range").focus()
+
+    def action_release(self) -> None:
+        self.release()
 
     def set_message(self, text: str, error: bool = False) -> None:
         """A muted prompt, or with `error` a warning, after the inputs; "" clears it."""
@@ -462,7 +491,7 @@ class CycleDayScreen(ModalScreen):
         with Vertical():
             yield Static("计费周期开始日", classes="title")
             yield Static("每月这一天的 00:00 UTC 开始新周期（1–28）")
-            yield Input(str(self._current), restrict=r"[0-9]*", max_length=2)
+            yield CharInput(str(self._current), takes=DIGITS, restrict=r"[0-9]*", max_length=2)
             yield Static("回车保存 · Esc 取消", classes="error")
 
     def on_mount(self) -> None:
