@@ -459,3 +459,18 @@ def test_summary_overwrites_atomically():
     write_summary([], copy.deepcopy(DEFAULT_STATE), now + 1000)
     assert json.loads((cache_dir() / "summary.json").read_text())["cycle_cost"] == 0.0
     assert os.listdir(cache_dir()) == ["summary.json"]
+
+
+
+def test_cost_helpers_match_the_summary(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    now = 1_792_000_000_000
+    start = usage_store.cycle_start_ms(now, 8)
+    rows = [{"t": start - 1, "cost": 100.0}, {"t": start, "cost": 1.5}, {"t": now - 1, "cost": 2.0},
+            {"t": now - 2, "cost": None}, {"t": now, "cost": 50.0}]
+    assert usage_store.cost_between(rows, (start, now)) == 3.5
+    today, cycle = usage_store.today_and_cycle_cost(rows, 8, now)
+    assert cycle == 3.5
+    result = usage_store.DeviceResult("d", rows, True)
+    summary = usage_store.write_summary([result], {"cycle_start_day": 8}, now)
+    assert (summary["today_cost"], summary["cycle_cost"]) == (today, cycle)

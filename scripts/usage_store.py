@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from billing_usage import fetch_device_rows, hint_for
 from usage_groups import GROUPINGS, METRICS, fmt_usd, total
@@ -254,9 +254,17 @@ def fetch_start(state: dict, now_ms: int) -> str:
 
 # ---------------------------------------------------------------- status-line summary
 
-def _cost_between(rows: List[Row], bounds) -> float:
+def cost_between(rows: Iterable[Row], bounds: Tuple[int, int]) -> float:
+    """Cost of the rows with `from <= t < to`; unpriced rows add nothing."""
     first, last = bounds
     return total((r for r in rows if first <= r["t"] < last), "cost")
+
+
+def today_and_cycle_cost(rows: List[Row], cycle_day: int, now_ms: int) -> Tuple[float, float]:
+    """(cost today, cost this billing cycle) over `rows`: what summary.json and the TUI header show."""
+    bounds = dict(cycle_day=cycle_day, week_resets_at_ms=None, custom_start="", custom_end="")
+    return (cost_between(rows, range_bounds("today", now_ms, **bounds)),
+            cost_between(rows, range_bounds("cycle", now_ms, **bounds)))
 
 
 def write_summary(results: List[DeviceResult], state: dict, now_ms: int) -> Dict[str, Any]:
@@ -267,9 +275,7 @@ def write_summary(results: List[DeviceResult], state: dict, now_ms: int) -> Dict
     when the file cannot be written.
     """
     rows = [r for result in results for r in result.rows]
-    bounds = dict(cycle_day=state["cycle_start_day"], week_resets_at_ms=None, custom_start="", custom_end="")
-    today_cost = _cost_between(rows, range_bounds("today", now_ms, **bounds))
-    cycle_cost = _cost_between(rows, range_bounds("cycle", now_ms, **bounds))
+    today_cost, cycle_cost = today_and_cycle_cost(rows, state["cycle_start_day"], now_ms)
     summary = {
         "today_cost": today_cost,
         "cycle_cost": cycle_cost,

@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from billing_usage import fetch_device_rows, load_devices  # noqa: E402
 from usage_groups import GROUPINGS, METRICS, aggregate, fmt_usd, model_slots, segments, total, visible  # noqa: E402
 from usage_store import (DeviceResult, fetch_start, load_cached, load_state, read_week_resets_at_ms,  # noqa: E402
-                         refresh_all, save_state, write_summary)
+                         refresh_all, save_state, today_and_cycle_cost, write_summary)
 from usage_time import GRANULARITIES, RANGE_BUCKETS, RANGES, range_bounds  # noqa: E402
 
 WEEK_WAITING = "（等待状态栏记录重置时间）"
@@ -49,12 +49,6 @@ def offline_line(result: DeviceResult, now: int) -> str:
     return "%s 离线 · %s" % (result.name, when) + (" · " + reason if reason else "")
 
 
-def _cost_in(rows: List[dict], key: str, state: dict, now: int) -> float:
-    first, last = range_bounds(key, now, cycle_day=state["cycle_start_day"], week_resets_at_ms=None,
-                               custom_start="", custom_end="")
-    return total((r for r in rows if first <= r["t"] < last), "cost")
-
-
 def granularity_label(label: str) -> str:
     """`每 4 小时`, and `每天` / `每小时` / `每分钟` for a single unit."""
     return "每" + label[2:] if label.startswith("1 ") else "每 " + label
@@ -70,9 +64,8 @@ def run_once(devices: List[dict], config_dir: str, timeout: int) -> int:
         summary = write_summary(results, state, now)
         cycle_text, today_text = summary["cycle_text"], summary["today_text"]
     except OSError:  # no summary file, but the line can still be printed
-        rows = [r for res in results for r in res.rows]
-        cycle_text = fmt_usd(_cost_in(rows, "cycle", state, now))
-        today_text = fmt_usd(_cost_in(rows, "today", state, now))
+        today, cycle = today_and_cycle_cost([r for res in results for r in res.rows], state["cycle_start_day"], now)
+        cycle_text, today_text = fmt_usd(cycle), fmt_usd(today)
     ok = sum(1 for r in results if r.ok)
     print("本周期 %s · 今日 %s · %d/%d 台在线" % (cycle_text, today_text, ok, len(results)))
     for result in results:
@@ -135,6 +128,10 @@ class UsageApp(App):
         self._refreshed = False  # a refresh has finished at least once
         self._last_refresh_ms: Optional[int] = None
         self._fetched_from: Optional[str] = None  # the start date the rows on hand were fetched from
+        self._refresh_error: Optional[str] = None  # why the latest refresh failed as a whole; None after a good one
+        # 自定义日期 picked but no valid dates entered yet: the word and the date row show, the data keeps the
+        # previous range (state[section]["range"] is only set to "custom" once a pair is entered).
+        self._pending_custom = {section: False for section in SECTIONS}
 
     # ------------------------------------------------------------ layout
 
@@ -269,9 +266,8 @@ class UsageApp(App):
         now = now_ms()
         if shown is None:
             shown = {section: self._section_rows(section, now)[0] for section in SECTIONS}
-        rows = self._all_rows()
-        parts = [("今日 ", fmt_metric(_cost_in(rows, "today", self.state, now), "cost")),
-                 ("本周期 ", fmt_metric(_cost_in(rows, "cycle", self.state, now), "cost"))]
+        today, cycle = today_and_cycle_cost(self._all_rows(), self.state["cycle_start_day"], now)
+        parts = [("今日 ", fmt_metric(today, "cost")), ("本周期 ", fmt_metric(cycle, "cost"))]
         ok = sum(1 for r in self.results if r.ok)
         if self._refreshed:
             parts.append(("", "%d/%d" % (ok, len(self.results)), " 台在线"))
@@ -294,6 +290,8 @@ class UsageApp(App):
         title_box.update(title)
 
         alerts = []
+        if self._refresh_error is not None:
+            alerts.append(Text("刷新失败：%s" % self._refresh_error, style=ALERT))
         for result in self.results:
             if not result.ok and result.error is not None:
                 alerts.append(Text(offline_line(result, now), style=ALERT))
@@ -326,20 +324,27 @@ class UsageApp(App):
         return True
 
     def _refresh_thread(self, start: str) -> None:
+        error = None
         try:
             results = refresh_all(self.devices, start, self.timeout, self.config_dir, fetch=self.fetch)
-        except Exception:  # refresh_all handles each device; anything else keeps the old data
-            results = None
+        except Exception as e:  # refresh_all handles each device; anything else keeps the old data
+            results, error = None, str(e) or type(e).__name__
         try:
-            self.call_from_thread(self._refresh_done, results, start)
+            self.call_from_thread(self._refresh_done, results, start, error)
         except RuntimeError:
             pass  # the app has gone
 
-    def _refresh_done(self, results: Optional[List[DeviceResult]], start: str) -> None:
-        if results is not None:
-            self.results = results
-            self._slots = self._compute_slots()
-            self._fetched_from = start
+    def _refresh_done(self, results: Optional[List[DeviceResult]], start: str, error: Optional[str] = None) -> None:
+        self._refreshing = False
+        if results is None:
+            # Keep the old rows, age and summary.json as they were and say so; the next tick retries.
+            self._refresh_error = error or "未知错误"
+            self.render_all()
+            return
+        self.results = results
+        self._slots = self._compute_slots()
+        self._fetched_from = start
+        self._refresh_error = None
         self._refreshed = True
         now = now_ms()
         self._last_refresh_ms = now
@@ -347,7 +352,6 @@ class UsageApp(App):
             write_summary(self.results, self.state, now)
         except OSError:
             pass
-        self._refreshing = False
         self.render_all()
         if fetch_start(self.state, now_ms()) < start:  # a choice made meanwhile needs older rows
             self.start_refresh()
@@ -363,7 +367,8 @@ class UsageApp(App):
         """Fetch again when the choices now reach further back than the rows on hand."""
         if self._refreshing:
             return  # _refresh_done checks once the running refresh is in
-        if self._fetched_from is None or fetch_start(self.state, now_ms()) < self._fetched_from:
+        # Nothing fetched yet means the refreshes so far failed; the timer retries those, not every choice.
+        if self._fetched_from is not None and fetch_start(self.state, now_ms()) < self._fetched_from:
             self.start_refresh()
 
     # ------------------------------------------------------------ choices
@@ -374,21 +379,37 @@ class UsageApp(App):
         except OSError:
             pass
 
+    def _custom_dates_ok(self, start: str, end: str) -> bool:
+        """A start date is given and the pair makes a range that is not inverted."""
+        if not start:
+            return False
+        try:
+            bounds = range_bounds("custom", now_ms(), cycle_day=self.state["cycle_start_day"],
+                                  week_resets_at_ms=None, custom_start=start, custom_end=end)
+        except ValueError:
+            return False
+        return bounds is not None and bounds[0] <= bounds[1]
+
     def on_sentence_bar_changed(self, message: SentenceBar.Changed) -> None:
         section, field, value = message.section, message.field, message.value
         s = self.state[section]
-        s[field] = value
         bar = self.query_one(f"#{section}-sentence", SentenceBar)
         bar.set_value(field, value)
         if field == "range":
-            if section == "timeline" and value in RANGE_BUCKETS:
-                s["granularity"] = RANGE_BUCKETS[value]
-                bar.set_value("granularity", s["granularity"])
             dates = self.query_one(f"#{section}-dates", DateRange)
             dates.set_class(value == "custom", "shown")
-            dates.set_error("")
+            self._pending_custom[section] = False
+            dates.set_message("")
             if value == "custom":
                 dates.focus_start()
+                if s["range"] != "custom" and not self._custom_dates_ok(s["start"], s["end"]):
+                    self._pending_custom[section] = True  # keep showing the previous range until dates are in
+                    dates.set_message("输入起止日期后回车")
+            elif section == "timeline" and value in RANGE_BUCKETS:
+                s["granularity"] = RANGE_BUCKETS[value]
+                bar.set_value("granularity", s["granularity"])
+        if not self._pending_custom[section] or field != "range":
+            s[field] = value
         self._save()
         self.render_all()
         self._refetch_if_needed()
@@ -396,15 +417,12 @@ class UsageApp(App):
     def on_date_range_submitted(self, message: DateRange.Submitted) -> None:
         section = message.section
         dates = self.query_one(f"#{section}-dates", DateRange)
-        try:
-            bounds = range_bounds("custom", now_ms(), cycle_day=self.state["cycle_start_day"],
-                                  week_resets_at_ms=None, custom_start=message.start, custom_end=message.end)
-        except ValueError:
-            bounds = None
-        if bounds is None or bounds[1] < bounds[0]:
-            dates.set_error("日期无效")
+        if not self._custom_dates_ok(message.start, message.end):
+            dates.set_message("日期无效", error=True)
             return
-        dates.set_error("")
+        dates.set_message("")
+        self._pending_custom[section] = False
+        self.state[section]["range"] = "custom"
         self.state[section]["start"], self.state[section]["end"] = message.start, message.end
         self._save()
         self.render_all()
@@ -439,6 +457,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     code = app.return_code or 0
     if app.refreshing:  # a slow device is still being read; its threads would hold the exit until --timeout
         sys.stdout.flush()
+        sys.stderr.flush()
         os._exit(code)
     return code
 

@@ -281,6 +281,11 @@ def test_custom_dates_validate_and_save():
     async def body(pilot):
         app.post_message(SentenceBar.Changed("share", "range", "custom"))
         await settle(app, pilot)
+        # nothing typed yet: a neutral prompt, and the previous range (本计费周期) still drives the data
+        text = screen_text(app)
+        assert "输入起止日期后回车" in text and "日期无效" not in text
+        assert "花费 · 所有设备 · 按项目 · 自定义日期" in text and "nasa718" in text and "$6" in text
+        assert saved_state() is None or saved_state()["share"]["range"] == "cycle"
         start, end = app.query("#share-dates Input").results(Input)
         start.value, end.value = "2026-13-01", ""
         start.focus()
@@ -295,9 +300,40 @@ def test_custom_dates_validate_and_save():
         start.value, end.value = "2026-01-01", today
         await pilot.press("enter")
         await settle(app, pilot)
-        assert "日期无效" not in screen_text(app)
-        assert saved_state()["share"]["start"] == "2026-01-01" and saved_state()["share"]["end"] == today
+        text = screen_text(app)
+        assert "日期无效" not in text and "输入起止日期后回车" not in text
+        saved = saved_state()["share"]
+        assert saved["range"] == "custom" and saved["start"] == "2026-01-01" and saved["end"] == today
         assert "nasa718" in screen_text(app)
+        # leave and come back: the entered dates apply at once, with no prompt
+        app.post_message(SentenceBar.Changed("share", "range", "7d"))
+        await settle(app, pilot)
+        app.post_message(SentenceBar.Changed("share", "range", "custom"))
+        await settle(app, pilot)
+        text = screen_text(app)
+        assert "输入起止日期后回车" not in text and "日期无效" not in text
+        assert saved_state()["share"]["range"] == "custom"
+    run(app, body)
+
+
+def test_custom_pick_then_back_without_dates_keeps_state_clean():
+    app = UsageApp(DEVS, config_dir="x", fetch=fake_fetch)
+
+    async def body(pilot):
+        app.post_message(SentenceBar.Changed("timeline", "range", "custom"))
+        await settle(app, pilot)
+        assert "输入起止日期后回车" in screen_text(app)
+        start = app.query("#timeline-dates Input").results(Input).__next__()
+        start.value = ""
+        start.focus()
+        await pilot.press("enter")  # submitting nothing is an actual invalid pair
+        await pilot.pause()
+        assert "日期无效" in screen_text(app)
+        app.post_message(SentenceBar.Changed("timeline", "range", "today"))
+        await settle(app, pilot)
+        text = screen_text(app)
+        assert "日期无效" not in text and "输入起止日期后回车" not in text
+        assert saved_state()["timeline"]["range"] == "today"
     run(app, body)
 
 
@@ -448,4 +484,66 @@ def test_refresh_age_and_week_option_follow_time_and_limits():
         await pilot.press("enter")
         await pilot.pause()
         assert not app.screen.query_one(OptionList).get_option("week").disabled
+    run(app, body)
+
+
+
+def test_failed_refresh_keeps_old_data_age_and_summary(monkeypatch):
+    import billing_usage_tui
+    app = UsageApp(DEVS, config_dir="x", fetch=fake_fetch)
+    summary_path = usage_store.cache_dir() / "summary.json"
+    calls = []
+    real_refresh_all = billing_usage_tui.refresh_all
+
+    def broken(*args, **kwargs):
+        calls.append(args[1])
+        raise RuntimeError("disk on fire")
+
+    async def body(pilot):
+        before = summary_path.read_text()
+        mtime = summary_path.stat().st_mtime_ns
+        app._last_refresh_ms = int(time.time() * 1000) - 5 * 60_000 - 1000
+        monkeypatch.setattr(billing_usage_tui, "refresh_all", broken)
+        await pilot.press("r")
+        await settle(app, pilot)
+        text = screen_text(app)
+        assert "刷新失败：disk on fire" in text
+        assert "5 分钟前刷新" in text and "刚刚刷新" not in text
+        assert "本周期 $6" in text and "2/2 台在线" in text and "nasa718" in text
+        assert summary_path.read_text() == before and summary_path.stat().st_mtime_ns == mtime
+        # a choice that needs no older rows does not set off another attempt; the timer retries
+        app.post_message(SentenceBar.Changed("share", "by", "skill"))
+        await settle(app, pilot)
+        assert len(calls) == 1
+        app._tick()
+        await settle(app, pilot)
+        assert len(calls) == 2
+        monkeypatch.setattr(billing_usage_tui, "refresh_all", real_refresh_all)
+        await pilot.press("r")
+        await settle(app, pilot)
+        text = screen_text(app)
+        assert "刷新失败" not in text and "刚刚刷新" in text
+        assert json.loads(summary_path.read_text())["updated_at"] >= json.loads(before)["updated_at"]
+    run(app, body)
+
+
+def test_first_refresh_failing_does_not_refresh_on_every_choice(monkeypatch):
+    import billing_usage_tui
+    usage_store.refresh_all(DEVS, "2026-01-01", 5, "x", fetch=fake_fetch, now_ms=NOW)  # a cache to show
+    calls = []
+
+    def broken(*args, **kwargs):
+        calls.append(args[1])
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(billing_usage_tui, "refresh_all", broken)
+    app = UsageApp(DEVS, config_dir="x", fetch=fake_fetch)
+
+    async def body(pilot):
+        assert "刷新失败：boom" in screen_text(app) and "本周期 $6" in screen_text(app)
+        assert not (usage_store.cache_dir() / "summary.json").exists()
+        for by in ("skill", "device", "model"):
+            app.post_message(SentenceBar.Changed("share", "by", by))
+            await settle(app, pilot)
+        assert len(calls) == 1
     run(app, body)

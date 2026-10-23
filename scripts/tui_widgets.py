@@ -390,8 +390,9 @@ class DateRange(Horizontal):
     DateRange > Input {{
         width: 14; height: 1; border: none; padding: 0 1; background: {SURFACE}; color: {BRIGHT};
     }}
-    DateRange > Input:focus {{ background: #2d3038; }}
-    DateRange > .error {{ color: {WARN}; }}
+    DateRange > Input:focus {{ border: none; background: #2d3038; background-tint: {BG} 0%; }}
+    DateRange > .message {{ color: {MUTED}; }}
+    DateRange > .message.error {{ color: {WARN}; }}
     """
 
     class Submitted(Message):
@@ -408,8 +409,7 @@ class DateRange(Horizontal):
         yield Input(self._start, placeholder="YYYY-MM-DD", max_length=10, classes="start")
         yield Static(" 到 ")
         yield Input(self._end, placeholder="YYYY-MM-DD", max_length=10, classes="end")
-        yield Static("  回车确认", classes="hint")
-        yield Static("", classes="error")
+        yield Static("", classes="message")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         event.stop()
@@ -420,8 +420,11 @@ class DateRange(Horizontal):
     def focus_start(self) -> None:
         self.call_after_refresh(self.query_one(".start", Input).focus)
 
-    def set_error(self, text: str) -> None:
-        self.query_one(".error", Static).update(("  " + text) if text else "")
+    def set_message(self, text: str, error: bool = False) -> None:
+        """A muted prompt, or with `error` a warning, after the inputs; "" clears it."""
+        message = self.query_one(".message", Static)
+        message.update(("  " + text) if text else "")
+        message.set_class(error, "error")
 
 
 class CycleDayScreen(ModalScreen):
@@ -431,11 +434,13 @@ class CycleDayScreen(ModalScreen):
     DEFAULT_CSS = f"""
     CycleDayScreen {{ align: center middle; }}
     CycleDayScreen > Vertical {{
-        width: 44; height: auto; padding: 1 2; background: {SURFACE}; border: round #3a3d45;
+        width: 50; height: auto; padding: 1 2; background: {SURFACE}; border: round #3a3d45;
     }}
     CycleDayScreen Static {{ color: {MUTED}; }}
     CycleDayScreen .title {{ color: {BRIGHT}; }}
-    CycleDayScreen Input {{ margin: 1 0 0 0; border: none; height: 1; padding: 0 1; background: #2d3038; }}
+    CycleDayScreen Input, CycleDayScreen Input:focus {{
+        margin: 1 0 0 0; border: none; height: 1; padding: 0 1; background: #2d3038; background-tint: {BG} 0%;
+    }}
     CycleDayScreen .error {{ color: {WARN}; height: 1; }}
     """
 
