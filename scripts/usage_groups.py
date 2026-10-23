@@ -4,8 +4,10 @@ Pure standard library, no I/O. A row is one request as billing_usage.request_row
 "device" the TUI adds: {"t", "model", "effort", "project", "skill", "device", "input", "output", "cache_write",
 "cache_write_1h", "cache_read", "cost" (float or None), "premium"}.
 
-The share table lists aggregate()'s groups; the timeline and its legend draw segments(), which merges the long
-tail into one grey "其他" and drops groups too small to see. Colours are fixed per name, never per rank.
+The share table lists visible(aggregate(...)) and greys the rows named in the "其他" group's member_keys; the
+timeline and its legend draw segments(), which merges the long tail into one grey "其他" and drops groups too
+small to see. Colours are fixed per name, never per rank; pass the same `slots` (from model_slots() over all rows)
+to every aggregate()/segments() call so a model keeps its colour when the rows are filtered.
 """
 import re
 from dataclasses import dataclass
@@ -33,9 +35,10 @@ MODEL_SLOTS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "clau
                "claude-sonnet-5"]
 
 TOP_N = 6  # groups segments() keeps before merging the rest into "其他"
-MIN_SHARE_DIV = 1000  # segments() drops groups under 1/1000 (0.1%) of the total
+MIN_SHARE_DIV = 1000
+MIN_SHARE = 1 / MIN_SHARE_DIV  # groups under this share (0.1%) of the total are not listed; visible() applies it
 OTHER_KEY = "__other__"  # Group.key of the merged "其他"; no project, device or skill is named like this
-_DATE_SUFFIX = re.compile(r"\d{8}$")
+_DATE_SUFFIX = re.compile(r"(?<=.)-\d{8}$")  # a dated build: claude-opus-5-5-20261001
 
 
 # ---------------------------------------------------------------- rows
@@ -59,8 +62,9 @@ class Group:
     cache_write: int
     model: Optional[str]
     effort: Optional[str]
-    members: int = 1  # how many groups were merged into this one
+    members: int = 1  # the merged "其他": how many groups it holds (len(member_keys))
     other: bool = False  # the merged "其他"
+    member_keys: Tuple[str, ...] = ()  # the merged "其他": Group.key of every group in it; () on any other group
 
     def value(self, metric: str) -> float:
         return {"cost": self.cost, "tokens": self.tokens, "requests": self.requests}[metric]
@@ -79,14 +83,9 @@ def total(rows: Iterable[dict], metric: str) -> float:
 
 # ---------------------------------------------------------------- models, colours, prices
 
-def _base_model(model: str) -> Optional[str]:
-    """The listed model `model` is, or a dated build of (`<listed>-YYYYMMDD`); None for any other model."""
-    best = None
-    for listed in MODEL_SLOTS:
-        if model == listed or (model.startswith(listed + "-") and _DATE_SUFFIX.fullmatch(model[len(listed) + 1:])):
-            if best is None or len(listed) > len(best):
-                best = listed
-    return best
+def _strip_date(model: str) -> str:
+    """The model without a `-YYYYMMDD` build date: claude-opus-5-5-20261001 -> claude-opus-5-5."""
+    return _DATE_SUFFIX.sub("", model)
 
 
 def _unknown(model: Optional[str]) -> bool:
@@ -94,25 +93,25 @@ def _unknown(model: Optional[str]) -> bool:
 
 
 def _model_ranks(models: Iterable[str]) -> Dict[str, int]:
-    """Colour-assignment order: the six listed models first, then the rest by name, unknown last."""
+    """Colour-assignment order, by base name (a dated build ranks with its base): the six listed models in their
+    listed order, then the others by name, an unknown model last."""
     models = set(models)
+    spares = sorted({_strip_date(m) for m in models if _strip_date(m) not in MODEL_SLOTS and not _unknown(m)})
     ranks = {}
     for m in models:
-        base = _base_model(m)
-        if base is not None:
+        base = _strip_date(m)
+        if base in MODEL_SLOTS:
             ranks[m] = MODEL_SLOTS.index(base)
-    spares = sorted(m for m in models if m not in ranks and not _unknown(m))
-    for i, m in enumerate(spares):
-        ranks[m] = len(MODEL_SLOTS) + i
-    for m in models:
-        if m not in ranks:
+        elif _unknown(m):
             ranks[m] = len(MODEL_SLOTS) + len(spares)
+        else:
+            ranks[m] = len(MODEL_SLOTS) + spares.index(base)
     return ranks
 
 
 def model_slots(models: List[str]) -> Dict[str, int]:
-    """Colour slot (index into SLOT_RAMPS) per model. A dated build shares its base model's slot; the other
-    models, by name order, take the slots after the listed six, wrapping round."""
+    """Colour slot (index into SLOT_RAMPS) per model. A dated build shares its base model's slot; models other
+    than the listed six take the slots after them, by base-name order, wrapping round."""
     return {m: rank % len(SLOT_RAMPS) for m, rank in _model_ranks(models).items()}
 
 
@@ -134,9 +133,9 @@ def model_color(model: str, effort: str, slots: Dict[str, int]) -> str:
     if effort not in EFFORTS or _unknown(model):
         return GREY
     slot = slots.get(model)
-    if slot is None:  # not in `slots`: the same answer model_slots() gives for the listed models
-        base = _base_model(model)
-        slot = MODEL_SLOTS.index(base) if base is not None else _name_hash(model)
+    if slot is None:  # not in `slots`: the listed models keep theirs, any other gets a stable one from its name
+        base = _strip_date(model)
+        slot = MODEL_SLOTS.index(base) if base in MODEL_SLOTS else _name_hash(base)
     return SLOT_RAMPS[slot % len(SLOT_RAMPS)][EFFORTS.index(effort)]
 
 
@@ -147,12 +146,9 @@ def model_label(model: Optional[str], effort: str) -> str:
 
 
 def price_of(model: str) -> Optional[Tuple[float, ...]]:
-    """(input, 5m write, 1h write, read, output) USD per million tokens: the model's own entry in PRICES, else
-    that of the longest PRICES key it starts with (followed by `-`, as a dated build does); None if unpriced."""
-    if model in PRICES:
-        return PRICES[model]
-    keys = [k for k in PRICES if model.startswith(k + "-")]
-    return PRICES[max(keys, key=len)] if keys else None
+    """(input, 5m write, 1h write, read, output) USD per million tokens: the exact PRICES entry, as
+    billing_usage.cost_of looks it up, so a dated build has none (the report shows it unpriced, cost None)."""
+    return PRICES.get(model)
 
 
 # ---------------------------------------------------------------- grouping
@@ -176,15 +172,18 @@ def _add(group: Group, r: dict) -> None:
     group.cache_write += r["cache_write"]
 
 
-def aggregate(rows: List[dict], by: str) -> List[Group]:
+def aggregate(rows: List[dict], by: str, slots: Optional[Dict[str, int]] = None) -> List[Group]:
     """One Group per distinct key, none dropped or merged. By model the key is (model, effort), in colour-slot
-    order and then effort order; otherwise the group is the project, device or skill, largest cost first."""
+    order and then effort order; otherwise the group is the project, device or skill, largest cost first.
+    `slots` (model_slots() over all the rows, not just these) fixes the model colours; None derives them from
+    `rows`, which recolours the non-listed models when `rows` is a subset."""
     if by not in GROUPINGS:
         raise ValueError("unknown grouping %r" % (by,))
     groups = {}  # type: Dict[Tuple[str, ...], Group]
     if by == "model":
         ranks = _model_ranks({str(r["model"]) for r in rows})
-        slots = {m: rank % len(SLOT_RAMPS) for m, rank in ranks.items()}
+        if slots is None:
+            slots = {m: rank % len(SLOT_RAMPS) for m, rank in ranks.items()}
         for r in rows:
             model, effort = str(r["model"]), r["effort"]
             if (model, effort) not in groups:
@@ -204,7 +203,9 @@ def aggregate(rows: List[dict], by: str) -> List[Group]:
 
 def _merge(groups: List[Group]) -> Group:
     other = _empty(OTHER_KEY, "其他 · %d 个" % len(groups), GREY, None, None)
-    other.members, other.other = len(groups), True
+    other.other = True
+    other.member_keys = tuple(g.key for g in groups)
+    other.members = len(other.member_keys)
     for g in groups:
         other.requests += g.requests
         other.tokens += g.tokens
@@ -216,19 +217,31 @@ def _merge(groups: List[Group]) -> Group:
     return other
 
 
-def segments(rows: List[dict], by: str, metric: str) -> List[Group]:
-    """The groups the timeline and legend draw. Groups under 0.1% of the metric are left out (total() still
-    counts them). By model every other group stays; otherwise the top 6 by `metric` stay and the rest merge
-    into one grey "其他 · N 个" - unless the rest is a single group, which then shows as itself."""
+def visible(groups: List[Group], metric: str, whole: float) -> List[Group]:
+    """The groups worth listing: those with some of `metric` and at least 0.1% of `whole` (the metric's total
+    over all rows, which the dropped groups still count in). The merged "其他" is exempt from the 0.1%."""
+    return [g for g in groups
+            if g.value(metric) > 0 and (g.other or g.value(metric) * MIN_SHARE_DIV >= whole)]
+
+
+def segments(rows: List[dict], by: str, metric: str, slots: Optional[Dict[str, int]] = None) -> List[Group]:
+    """The groups the timeline and legend draw. By model: every group with 0.1% or more of the metric. Otherwise
+    the groups are ranked by `metric`, the top 6 stay and the rest - small ones included - merge into one grey
+    "其他 · N 个" (member_keys says which), unless the rest is a single group, which then shows as itself;
+    then any group other than "其他" under 0.1% of total() is dropped. Groups with none of the metric are ignored.
+    So the segments add up to total() except for what was dropped: by model any group under 0.1%, otherwise
+    only a group under 0.1% that was left over on its own or ranked in the top 6."""
     whole = total(rows, metric)
-    kept = [g for g in aggregate(rows, by) if g.value(metric) > 0 and g.value(metric) * MIN_SHARE_DIV >= whole]
-    if by == "model":
-        return kept
-    kept.sort(key=lambda g: -g.value(metric))  # stable: aggregate()'s order breaks ties
-    top, rest = kept[:TOP_N], kept[TOP_N:]
-    if len(rest) == 1:
-        return top + rest
-    return top + [_merge(rest)] if rest else top
+    groups = [g for g in aggregate(rows, by, slots) if g.value(metric) > 0]
+    if by != "model":
+        groups.sort(key=lambda g: -g.value(metric))  # stable: aggregate()'s order breaks ties
+        top, rest = groups[:TOP_N], groups[TOP_N:]
+        if len(rest) == 1:
+            top = top + rest
+        elif rest:
+            top = top + [_merge(rest)]
+        groups = top
+    return visible(groups, metric, whole)
 
 
 # ---------------------------------------------------------------- number formats

@@ -3,9 +3,9 @@ import re
 import pytest
 
 from billing_usage import PRICES
-from usage_groups import (EFFORTS, GREY, GROUPINGS, METRICS, MODEL_SLOTS, SLOT_RAMPS, Group, aggregate, fmt_num,
-                          fmt_pct, fmt_usd, model_color, model_label, model_slots, name_color, price_of, row_tokens,
-                          segments, total)
+from usage_groups import (EFFORTS, GREY, GROUPINGS, METRICS, MIN_SHARE, MODEL_SLOTS, SLOT_RAMPS, Group, aggregate,
+                          fmt_num, fmt_pct, fmt_usd, model_color, model_label, model_slots, name_color, price_of,
+                          row_tokens, segments, total, visible)
 
 OPUS, SONNET, HAIKU = "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"
 
@@ -95,6 +95,18 @@ def test_model_slots_dated_ids_share_their_base_slot():
     assert model_slots(["claude-opus-5-6"]) == {"claude-opus-5-6": 0}
 
 
+def test_model_slots_dated_spare_shares_its_base_slot():
+    slots = model_slots(["claude-zeta-1", "claude-zeta-1-20261001", "claude-alpha-1"])
+    assert slots == {"claude-alpha-1": 0, "claude-zeta-1": 1, "claude-zeta-1-20261001": 1}
+    # only the dated build present: it ranks by its base name, here after alpha
+    slots = model_slots(["claude-zeta-1-20261001", "claude-alpha-1"])
+    assert slots == {"claude-alpha-1": 0, "claude-zeta-1-20261001": 1}
+    # a dated build and its base are one spare, not two: the next spare does not move
+    assert model_slots(["claude-zeta-1", "claude-zeta-1-20261001", "claude-zz-1"])["claude-zz-1"] == 1
+    # only a trailing 8-digit date is a build date
+    assert model_slots(["claude-zeta-1", "claude-zeta-1-2026100"]) == {"claude-zeta-1": 0, "claude-zeta-1-2026100": 1}
+
+
 def test_model_slots_spares_cycle_through_the_six_colours_by_name():
     names = ["claude-m%d" % i for i in range(8)]
     slots = model_slots(list(reversed(names)))
@@ -105,6 +117,8 @@ def test_model_color_for_a_model_missing_from_slots():
     assert model_color(OPUS, "high", {}) == "#3987e5"     # still a listed model
     assert model_color("claude-opus-5-5-20261001", "high", {}) == "#3987e5"
     assert model_color("claude-zeta-1", "high", {}) in [ramp[2] for ramp in SLOT_RAMPS]
+    # a dated spare missing from slots still matches its base
+    assert model_color("claude-zeta-1-20261001", "high", {}) == model_color("claude-zeta-1", "high", {})
 
 
 def test_model_label():
@@ -115,12 +129,14 @@ def test_model_label():
     assert model_label("claude-opus-5-5-20261001", "max") == "opus-5-5-20261001 max"
 
 
-def test_price_of():
-    assert price_of("claude-opus-5-5-20261001") == PRICES["claude-opus-5-5"]
+def test_price_of_is_an_exact_lookup_like_cost_of():
+    for model, rates in PRICES.items():
+        assert price_of(model) == rates
     assert price_of("claude-opus-5") == PRICES["claude-opus-5"]     # not captured by opus-5-5
-    assert price_of("claude-opus-5-20260901") == PRICES["claude-opus-5"]
     assert price_of("claude-sonnet-5-5") == PRICES["claude-sonnet-5-5"]
-    assert price_of("claude-opus-55") is None                       # a prefix is not enough: it needs the dash
+    assert price_of("claude-opus-5-5-20261001") is None             # a dated build is unpriced, as in the report
+    assert price_of("claude-opus-5-20260901") is None
+    assert price_of("claude-opus-5-6") is None and price_of("claude-opus-55") is None
     assert price_of("claude-unknown-9") is None and price_of("None") is None and price_of("") is None
 
 
@@ -162,7 +178,7 @@ def test_row_tokens_and_group_value():
     assert row_tokens(r) == 15
     g = Group(key="k", label="k", color=GREY, requests=3, tokens=15, cost=2.5, input=1, output=2, cache_read=4,
               cache_write=8, model=None, effort=None)
-    assert (g.members, g.other) == (1, False)
+    assert (g.members, g.other, g.member_keys) == (1, False, ())
     assert (g.value("cost"), g.value("tokens"), g.value("requests")) == (2.5, 15, 3)
     with pytest.raises(KeyError):
         g.value("nope")
@@ -246,6 +262,31 @@ def test_aggregate_by_model_dated_build_sits_next_to_its_base():
     assert [g.model for g in aggregate(rows, "model")] == [OPUS, "claude-opus-5-5-20261001", SONNET]
 
 
+def test_aggregate_by_model_dated_spare_sits_next_to_its_base_and_shares_its_colour():
+    rows = [row(model="claude-zeta-1-20261001", effort="high"), row(model="claude-alpha-1", effort="high"),
+            row(model="claude-zeta-1", effort="high"), row(model="claude-zz-1", effort="high")]
+    groups = aggregate(rows, "model")
+    assert [g.model for g in groups] == ["claude-alpha-1", "claude-zeta-1", "claude-zeta-1-20261001", "claude-zz-1"]
+    assert groups[1].color == groups[2].color == SLOT_RAMPS[1][2]
+
+
+def test_spare_model_keeps_its_colour_on_a_filtered_subset_given_slots_from_all_rows():
+    rows = [row(model=OPUS, device="d1"), row(model="claude-alpha-1", device="d1"),
+            row(model="claude-zeta-1", device="d2"), row(model="claude-zeta-1", device="d1")]
+    slots = model_slots([r["model"] for r in rows])
+    assert slots["claude-zeta-1"] == 1
+    subset = [r for r in rows if r["device"] == "d2"]           # zeta alone
+    (derived,) = aggregate(subset, "model")
+    (fixed,) = aggregate(subset, "model", slots)
+    assert derived.color == SLOT_RAMPS[0][2]                    # derived from the subset: zeta moves to slot 0
+    assert fixed.color == SLOT_RAMPS[1][2] == model_color("claude-zeta-1", "high", slots)
+    (seg,) = segments(subset, "model", "cost", slots)
+    assert seg.color == fixed.color
+    full = {g.model: g.color for g in aggregate(rows, "model")}
+    assert full["claude-zeta-1"] == fixed.color                  # the same colour as on the full set
+    assert aggregate(subset, "model", slots)[0].key == aggregate(subset, "model")[0].key
+
+
 def test_aggregate_by_model_unknown_model_and_missing_effort():
     rows = [row(model="None", effort="none", cost=None)]
     (g,) = aggregate(rows, "model")
@@ -275,11 +316,14 @@ def test_segments_other_rule():
     assert [s.label for s in segs] == ["p0", "p1", "p2", "p3", "p4", "p5", "其他 · 3 个"]
     other = segs[-1]
     assert other.other and other.color == "#5b5e66" and other.members == 3
+    assert other.key not in {g.key for g in aggregate(rows, "project")}
+    assert other.member_keys == ("p6", "p7", "p8")                 # the merged groups' keys, biggest first
     assert (other.cost, other.requests) == (60, 3)
     assert other.tokens == 3 * (10 + 20 + 300 + 4000) and other.input == 30 and other.output == 60
     assert other.cache_read == 900 and other.cache_write == 12000
     assert (other.model, other.effort) == (None, None)
     assert not any(s.other for s in segs[:-1]) and all(s.members == 1 for s in segs[:-1])
+    assert all(s.member_keys == () for s in segs[:-1])
     assert sum(s.cost for s in segs) == total(rows, "cost") == sum(costs)
 
     # 7 projects -> all 7, no 其他 (a lone leftover is shown as itself)
@@ -310,15 +354,55 @@ def test_segments_tiny_group_among_seven_is_absent_and_does_not_make_an_other():
     assert total(rows, "cost") == pytest.approx(270.05)
 
 
-def test_segments_other_counts_only_groups_that_are_listed():
-    # 8 projects; p7 is a speck. The leftover after the top 6 is p6 alone, so it shows as itself.
-    rows = project_rows([70, 60, 50, 40, 30, 20, 10, 0.01])
+def test_segments_specks_are_merged_into_other_and_the_segments_add_up_to_the_total():
+    # 9 projects, 3 of them specks (0.011% together; costs are dyadic so every sum below is exact)
+    costs = [4000, 2000, 1000, 500, 250, 125, 0.5, 0.25, 0.125]
+    rows = project_rows(costs)
     segs = segments(rows, "project", "cost")
-    assert [s.label for s in segs] == ["p0", "p1", "p2", "p3", "p4", "p5", "p6"]
-    # 10 projects with two specks: 其他 holds the two visible leftovers
-    rows = project_rows([70, 60, 50, 40, 30, 20, 10, 9, 0.01, 0.02])
+    assert [s.label for s in segs] == ["p0", "p1", "p2", "p3", "p4", "p5", "其他 · 3 个"]
+    other = segs[-1]
+    assert other.other and other.members == 3 and other.member_keys == ("p6", "p7", "p8")
+    assert other.cost == 0.875 and other.cost / total(rows, "cost") < 0.001      # kept although under 0.1%
+    assert sum(s.cost for s in segs) == total(rows, "cost") == sum(costs)
+    assert sum(s.requests for s in segs) == total(rows, "requests")
+    assert sum(s.tokens for s in segs) == total(rows, "tokens")
+
+
+def test_segments_a_lone_leftover_that_is_a_speck_is_dropped_but_two_make_an_other():
+    # 7 projects, the 7th a speck: shown as itself, then dropped as under 0.1%
+    segs = segments(project_rows([70, 60, 50, 40, 30, 20, 0.01]), "project", "cost")
+    assert [s.label for s in segs] == ["p0", "p1", "p2", "p3", "p4", "p5"]
+    # 8 projects, the 8th a speck: the rest is two groups, so they merge, speck included
+    segs = segments(project_rows([70, 60, 50, 40, 30, 20, 10, 0.01]), "project", "cost")
+    assert [s.label for s in segs] == ["p0", "p1", "p2", "p3", "p4", "p5", "其他 · 2 个"]
+    assert segs[-1].cost == pytest.approx(10.01) and segs[-1].member_keys == ("p6", "p7")
+    # the rest is one big group and one speck: still a 其他, with both in it
+    segs = segments(project_rows([70, 60, 50, 40, 30, 20, 10, 9, 0.01, 0.02]), "project", "cost")
+    assert segs[-1].label == "其他 · 4 个" and segs[-1].member_keys == ("p6", "p7", "p9", "p8")
+    assert segs[-1].cost == pytest.approx(19.03) and len(segs) == 7
+
+
+def test_segments_ignore_groups_with_none_of_the_metric_when_merging():
+    costs = [70, 60, 50, 40, 30, 20, 10, None, None]            # two projects that only used unpriced models
+    rows = [row(project="p%d" % i, cost=c) for i, c in enumerate(costs)]
     segs = segments(rows, "project", "cost")
-    assert segs[-1].label == "其他 · 2 个" and segs[-1].cost == 19 and len(segs) == 7
+    assert [s.label for s in segs] == ["p0", "p1", "p2", "p3", "p4", "p5", "p6"] and not any(s.other for s in segs)
+    assert segments(rows, "project", "requests")[-1].label == "其他 · 3 个"
+
+
+def test_visible_and_min_share():
+    assert MIN_SHARE == 0.001
+    groups = aggregate(project_rows([999, 1, 0.5, 0]), "project")
+    assert [g.label for g in visible(groups, "cost", 1000.5)] == ["p0"]            # 1 is just under 0.1% of 1000.5
+    assert [g.label for g in visible(groups, "cost", 1000)] == ["p0", "p1"]        # exactly 0.1% stays; 0.5 and 0 go
+    assert [g.label for g in visible(groups, "requests", 4)] == ["p0", "p1", "p2", "p3"]
+    assert visible([], "cost", 0) == []
+    other = Group(key="__other__", label="其他 · 2 个", color=GREY, requests=2, tokens=2, cost=0.2, input=0, output=0,
+                  cache_read=0, cache_write=0, model=None, effort=None, members=2, other=True,
+                  member_keys=("a", "b"))
+    assert visible([other], "cost", 1000) == [other]                              # 其他 is exempt from the 0.1%
+    assert visible([other], "cost", 0.1) == [other]
+    assert visible([groups[2]], "cost", 1000) == []
 
 
 def test_segments_rank_by_the_chosen_metric_not_by_cost():
