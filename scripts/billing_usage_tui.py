@@ -30,6 +30,8 @@ from usage_store import (DeviceResult, fetch_start, load_cached, load_state, rea
 from usage_time import GRANULARITIES, RANGE_BUCKETS, RANGES, range_bounds  # noqa: E402
 
 WEEK_WAITING = "（等待状态栏记录重置时间）"
+# Models the user does not pay for: their cost stays 0 and the 未定价 warning leaves them out.
+NO_PRICE_NEEDED = {"claude-opus-4-7"}
 
 
 def now_ms() -> int:
@@ -315,7 +317,8 @@ class UsageApp(App):
         for section_rows in shown.values():
             for r in section_rows:
                 seen[id(r)] = r
-        unpriced = sorted({str(r["model"]) for r in seen.values() if r["cost"] is None})
+        unpriced = sorted({str(r["model"]) for r in seen.values()
+                           if r["cost"] is None and r["model"] not in NO_PRICE_NEEDED})
         if unpriced:
             alerts.append(Text("未定价：%s（tokens 计入，花费按 0）" % "、".join(unpriced), style=WARN))
         premium = sum(1 for r in seen.values() if r.get("premium"))

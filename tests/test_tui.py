@@ -144,6 +144,17 @@ def test_unpriced_and_premium_warnings():
     run(app, body)
 
 
+def test_models_needing_no_price_are_not_warned_about():
+    def fetch(dev, start, end, timeout, config_dir):
+        return {"rows": [row(NOW - 1000, "p", None, model="claude-opus-4-7"),
+                         row(NOW - 2000, "p", 1.0)], "unpriced": ["claude-opus-4-7"]}
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=fetch)
+
+    async def body(pilot):
+        assert "未定价" not in screen_text(app)
+    run(app, body)
+
+
 def test_empty_range_shows_no_data():
     app = UsageApp(DEVS, config_dir="x", fetch=lambda *a: {"rows": [], "unpriced": []})
 
