@@ -1,0 +1,10 @@
+Window (UTC): 2026-10-08 00:00 .. 2026-10-09 00:00, 3 unique requests
+cost_usd = list-price API equivalent (standard speed, global inference), not what a subscription is billed.
+
+day (UTC)            requests       input      output   cache_write     cache_read      in+out             all    cost_usd
+2026-10-08                  3         117          69         3,011         50,513         186          53,710        0.03
+TOTAL                       3         117          69         3,011         50,513         186          53,710        0.03
+
+WARNING: no price for claude-unknown-9; their tokens are counted but cost is 0.
+
+WARNING: 2 requests used fast mode or US-only inference (cost understated).

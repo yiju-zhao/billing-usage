@@ -1,0 +1,1 @@
+{"days": {"2026-10-08": {"requests": 3, "cost": 0.03247, "input_tokens": 117, "output_tokens": 69, "cache_creation_input_tokens": 3011, "cache_read_input_tokens": 50513}}, "unpriced": ["claude-unknown-9"], "premium": 2}

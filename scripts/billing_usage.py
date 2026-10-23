@@ -7,6 +7,7 @@ are deduplicated by (message.id, requestId); the row with the largest output_tok
 the earliest timestamp is the request's day. Devices come from a devices file (see
 devices.example.json): "local" reads this machine, "ssh" runs this same script on the device
 and reads back one line of JSON. Duplicates are removed per device, not across devices.
+--rows prints the deduplicated requests one by one instead of summing them per day.
 """
 import argparse
 import collections
@@ -24,6 +25,7 @@ BUCKET_KEYS = ("requests", "cost") + FIELDS
 DEFAULT_DEVICES_FILE = os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "billing-usage", "devices.json")
 SSH_CONNECT_TIMEOUT = 10
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 # USD per million tokens: (input, cache write 5m, cache write 1h, cache read, output).
 # Source: platform.claude.com/docs/en/about-claude/pricing, read 2026-10-19. A model missing
@@ -43,6 +45,17 @@ def parse_ts(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
+def cache_write_1h(u):
+    """Tokens of `u`'s cache writes that were billed at the 1-hour rate."""
+    cc = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else {}
+    return cc.get("ephemeral_1h_input_tokens") or 0
+
+
+def is_premium(u):
+    """Fast mode or US-only inference: the list price used here understates what these cost."""
+    return u.get("speed") == "fast" or u.get("inference_geo") == "us"
+
+
 def cost_of(model, u):
     rates = PRICES.get(model)
     if rates is None:
@@ -51,14 +64,17 @@ def cost_of(model, u):
     inp, out = u.get("input_tokens") or 0, u.get("output_tokens") or 0
     if model == "claude-haiku-5-5" and inp + read + write > 100_000:
         rates = HAIKU_LONG_PROMPT
-    cc = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else {}
-    write_1h = cc.get("ephemeral_1h_input_tokens") or 0
+    write_1h = cache_write_1h(u)
     p_in, p_w5, p_w1, p_read, p_out = rates
     return (inp * p_in + (write - write_1h) * p_w5 + write_1h * p_w1 + read * p_read + out * p_out) / 1e6
 
 
 def collect(projects_dir, start, end):
-    requests = {}  # key -> [first_ts, usage, model]
+    """Unique requests in [start, end): [first_ts, usage, model, meta], in first-seen order.
+
+    meta = {"effort", "cwd", "skill"} as found on the transcript row whose usage is kept.
+    """
+    requests = {}  # key -> [first_ts, usage, model, meta]
     for path in glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True):
         with open(path, errors="replace") as f:
             for line in f:
@@ -71,19 +87,20 @@ def collect(projects_dir, start, end):
                 if d.get("type") != "assistant" or not isinstance(usage, dict) or msg.get("model") == "<synthetic>":
                     continue  # <synthetic> rows are local error notices with zero tokens, not API requests
                 key = (msg.get("id"), d.get("requestId")) if msg.get("id") else d.get("uuid")
+                meta = {"effort": d.get("effort"), "cwd": d.get("cwd"), "skill": d.get("attributionSkill")}
                 prev = requests.get(key)
                 if prev is None:
-                    requests[key] = [ts, usage, msg.get("model")]
+                    requests[key] = [ts, usage, msg.get("model"), meta]
                 else:
                     prev[0] = min(prev[0], ts)
                     if usage.get("output_tokens", 0) > prev[1].get("output_tokens", 0):
-                        prev[1] = usage
+                        prev[1], prev[3] = usage, meta
     return [r for r in requests.values() if start <= r[0] < end]
 
 
 def tally_by_day(rows):
     out = collections.defaultdict(lambda: dict.fromkeys(BUCKET_KEYS, 0))
-    for ts, usage, model in rows:
+    for ts, usage, model, _ in rows:
         bucket = out[f"{ts:%Y-%m-%d}"]
         bucket["requests"] += 1
         for k in FIELDS:
@@ -92,14 +109,52 @@ def tally_by_day(rows):
     return dict(sorted(out.items()))
 
 
+def unpriced_models(collected):
+    return sorted({str(r[2]) for r in collected if r[2] not in PRICES})
+
+
 def summarize(config_dir, start, end):
     """One device's result: the JSON a remote run prints and a local run uses directly."""
     rows = collect(os.path.join(config_dir, "projects"), start, end)
     return {
         "days": tally_by_day(rows),
-        "unpriced": sorted({str(r[2]) for r in rows if r[2] not in PRICES}),
-        "premium": sum(1 for r in rows if r[1].get("speed") == "fast" or r[1].get("inference_geo") == "us"),
+        "unpriced": unpriced_models(rows),
+        "premium": sum(1 for r in rows if is_premium(r[1])),
     }
+
+
+def project_of(cwd):
+    """Last component of a working directory, lower-cased; "unknown" without one."""
+    if not isinstance(cwd, str):
+        return "unknown"
+    return cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower() or "unknown"
+
+
+def request_rows(collected):
+    """One dict per request from collect(), oldest first; an unpriced model has cost None."""
+    rows = []
+    for ts, usage, model, meta in collected:
+        rows.append({
+            "t": (ts - EPOCH) // timedelta(milliseconds=1),
+            "model": str(model),
+            "effort": meta["effort"] or "none",
+            "project": project_of(meta["cwd"]),
+            "skill": meta["skill"] or "none",
+            "input": usage.get("input_tokens") or 0,
+            "output": usage.get("output_tokens") or 0,
+            "cache_write": usage.get("cache_creation_input_tokens") or 0,
+            "cache_write_1h": cache_write_1h(usage),
+            "cache_read": usage.get("cache_read_input_tokens") or 0,
+            "cost": cost_of(model, usage),
+            "premium": is_premium(usage),
+        })
+    return sorted(rows, key=lambda r: r["t"])
+
+
+def summarize_rows(config_dir, start, end):
+    """Like summarize(), but the requests themselves: what `--rows` prints."""
+    collected = collect(os.path.join(config_dir, "projects"), start, end)
+    return {"rows": request_rows(collected), "unpriced": unpriced_models(collected)}
 
 
 def load_devices(path):
@@ -130,22 +185,23 @@ def load_devices(path):
     return devices
 
 
-def run_ssh(dev, a):
+def fetch_remote(dev, flag, start, end, timeout):
+    """Run this script on an ssh device with `flag` (--json or --rows) and return the JSON it prints."""
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}"]
     if dev.get("port"):
         ssh += ["-p", str(dev["port"])]
     if dev.get("identity_file"):
         ssh += ["-i", os.path.expanduser(dev["identity_file"])]
     target = f"{dev['user']}@{dev['address']}" if dev.get("user") else dev["address"]
-    remote = [dev.get("python", "python3"), "-", "--json", "--start", a.start]
-    if a.end:
-        remote += ["--end", a.end]
+    remote = [dev.get("python", "python3"), "-", flag, "--start", start]
+    if end:
+        remote += ["--end", end]
     if dev.get("config_dir"):
         remote += ["--config-dir", dev["config_dir"]]
     with open(os.path.abspath(__file__)) as f:
         source = f.read()
     proc = subprocess.run(ssh + [target, " ".join(shlex.quote(x) for x in remote)],
-                          input=source, capture_output=True, text=True, timeout=a.timeout)
+                          input=source, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
         lines = proc.stderr.strip().splitlines()
         raise RuntimeError(lines[-1] if lines else f"ssh exited with status {proc.returncode}")
@@ -154,6 +210,30 @@ def run_ssh(dev, a):
     if not json_lines:
         raise RuntimeError("no JSON in the remote output (is python3 installed there?)")
     return json.loads(json_lines[-1])
+
+
+def run_ssh(dev, a):
+    return fetch_remote(dev, "--json", a.start, a.end, a.timeout)
+
+
+def window(start, end):
+    """[start, end) as UTC datetimes from YYYY-MM-DD strings; `end` is inclusive and defaults to now."""
+    utc = timezone.utc
+    first = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=utc)
+    if end:
+        return first, datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=utc) + timedelta(days=1)
+    return first, datetime.now(utc)
+
+
+def fetch_device_rows(dev, start, end, timeout, config_dir):
+    """One device's {"rows", "unpriced"}; raises when the device cannot be read (see hint_for)."""
+    if dev["method"] == "local":
+        first, last = window(start, end)
+        return summarize_rows(os.path.expanduser(dev.get("config_dir") or config_dir), first, last)
+    try:
+        return fetch_remote(dev, "--rows", start, end, timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"timed out after {timeout}s") from None
 
 
 def run_device(dev, a, start, end):
@@ -242,18 +322,18 @@ def main():
     p.add_argument("--config-dir", default=os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude")))
     p.add_argument("--devices", help=f"devices file (default: {DEFAULT_DEVICES_FILE}, else this machine only)")
     p.add_argument("--timeout", type=int, default=120, help="seconds to wait for each ssh device (default: 120)")
-    p.add_argument("--json", action="store_true", help="print this machine's summary as one JSON line (used over ssh)")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--json", action="store_true", help="print this machine's summary as one JSON line (used over ssh)")
+    mode.add_argument("--rows", action="store_true", help="print this machine's requests, one by one, as one JSON line")
     a = p.parse_args()
 
-    utc = timezone.utc
-    start = datetime.strptime(a.start, "%Y-%m-%d").replace(tzinfo=utc)
-    if a.end:
-        end = datetime.strptime(a.end, "%Y-%m-%d").replace(tzinfo=utc) + timedelta(days=1)
-    else:
-        end = datetime.now(utc)
+    start, end = window(a.start, a.end)
 
     if a.json:
         print(json.dumps(summarize(os.path.expanduser(a.config_dir), start, end)))
+        return
+    if a.rows:
+        print(json.dumps(summarize_rows(os.path.expanduser(a.config_dir), start, end)))
         return
 
     devices = load_devices(a.devices)
