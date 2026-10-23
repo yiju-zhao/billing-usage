@@ -21,7 +21,7 @@ uv tool upgrade billing-usage      # later
 ## Use
 
 ```
-bu                         # the terminal UI; refreshes every 60 s
+bu                         # the terminal UI; refreshes every 15 minutes
 bu --once                  # refresh, print one line (本周期 … · 今日 … · n/m 台在线), exit
 bu report --start 2026-10-08 [--end 2026-10-31]   # per-day table (UTC) and TOTAL, as plain text
 ```
@@ -36,7 +36,7 @@ bu report --start 2026-10-08 [--end 2026-10-31]   # per-day table (UTC) and TOTA
 
 | Key | Action |
 | --- | --- |
-| `r` | refresh now (it also refreshes every 60 s, and never starts a second refresh while one is running) |
+| `r` | refresh now (it also refreshes every 15 minutes, and never starts a second refresh while one is running) |
 | `q` | quit |
 | `c` | set the billing-cycle start day, 1 to 28 (default 8; cycles start at 00:00 UTC) |
 | `+` (or `=`), `-` | zoom the timeline in and out; the bucket size follows the zoom |
@@ -96,7 +96,7 @@ tests each connection as it goes.
   - `limits.json`: `seven_day_resets_at`.
 - **State.** Your sentence choices and the cycle day are kept in `${XDG_STATE_HOME:-~/.local/state}/billing-usage/tui.json`.
 - **Status line.** A Claude Code status line can show `今日 … · 周期 …` from `summary.json` with one `jq` call, and
-  dim it once it is more than 10 minutes old. It can also record Claude Code's `rate_limits.seven_day.resets_at`
+  dim it once it is more than 20 minutes old. It can also record Claude Code's `rate_limits.seven_day.resets_at`
   into `limits.json`. Only a status line can record that value, and the range "自每周重置以来" stays unavailable
   until it is there.
 

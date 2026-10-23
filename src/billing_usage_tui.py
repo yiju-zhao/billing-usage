@@ -1,7 +1,7 @@
 """A resident terminal UI for Claude Code usage across every device in the billing-usage devices file.
 
 Two sections, as in token-meter's sidebar: a timeline and a share table, each headed by a sentence whose words
-you can change (click, or Tab then Enter). Refreshes every 60 s without any model call; `r` refreshes now,
+you can change (click, or Tab then Enter). Refreshes every 15 minutes without any model call; `r` refreshes now,
 `c` sets the billing-cycle start day, `q` quits. On the timeline, +/- zoom, ←/→ move the highlighted bar (pan
 once zoomed), ↑/↓ pick a legend entry, `i` shows only that segment, Esc lets go. `--once` refreshes, writes the
 status-line summary, prints one line and exits. `bu report` prints the per-day table (see billing_usage.py).
@@ -128,7 +128,7 @@ class UsageApp(App):
     """
 
     def __init__(self, devices: List[dict], *, config_dir: str, timeout: int = 120,
-                 fetch: Callable = fetch_device_rows, refresh_s: float = 60) -> None:
+                 fetch: Callable = fetch_device_rows, refresh_s: float = 15 * 60) -> None:
         super().__init__()
         self.devices, self.config_dir, self.timeout = devices, config_dir, timeout
         self.fetch, self.refresh_s = fetch, refresh_s
