@@ -4,7 +4,7 @@ import time
 import pytest
 
 from usage_time import (GRANULARITIES, MIN_SPAN_MS, RANGE_BUCKETS, RANGES, bucket_start, cycle_start_ms,
-                        range_bounds, zoom_granularity)
+                        next_bucket_start, range_bounds, zoom_granularity)
 
 MIN = 60_000
 HOUR = 3600_000
@@ -69,6 +69,33 @@ def test_week_range_steps_back_when_reset_is_over_seven_days_away():
     assert exactly_now == (now, now)
 
 
+def test_week_range_rolls_a_past_reset_forward():
+    now = ms("2026-10-22T05:00:00Z")
+    # The reset time is stale (12 days ago): the current weekly period began on the latest weekly step <= now.
+    assert bounds("week", now, week_resets_at_ms=ms("2026-10-10T10:00:00Z")) == (ms("2026-10-17T10:00:00Z"), now)
+    # Same answer as the future-dated reset of the same weekly cycle.
+    assert bounds("week", now, week_resets_at_ms=ms("2026-10-24T10:00:00Z")) == (ms("2026-10-17T10:00:00Z"), now)
+    assert bounds("week", now, week_resets_at_ms=ms("2026-10-31T10:00:00Z")) == (ms("2026-10-17T10:00:00Z"), now)
+    # Many weeks stale.
+    assert bounds("week", now, week_resets_at_ms=ms("2026-01-02T10:00:00Z")) == (ms("2026-10-16T10:00:00Z"), now)
+    # A reset that has just happened starts a new period at that moment.
+    assert bounds("week", now, week_resets_at_ms=now) == (now, now)
+    assert bounds("week", now, week_resets_at_ms=now - 1) == (now - 1, now)
+    # A reset exactly a week ago: the period that ended then is over, the next one began then.
+    assert bounds("week", now, week_resets_at_ms=now - 7 * D) == (now, now)
+    # And one millisecond short of a week ahead: that period began 1 ms ago.
+    assert bounds("week", now, week_resets_at_ms=now + 7 * D - 1) == (now - 1, now)
+
+
+def test_week_range_start_is_always_within_the_last_week():
+    now = ms("2026-10-22T05:00:00Z")
+    for offset in range(-30 * D, 30 * D, 5 * HOUR + 7):
+        start, end = bounds("week", now, week_resets_at_ms=now + offset)
+        assert end == now
+        assert now - 7 * D < start <= now
+        assert (now + offset - 7 * D - start) % (7 * D) == 0       # always a whole number of weeks from the reset
+
+
 def test_simple_ranges():
     now = ms("2026-10-22T05:00:00Z")
     assert bounds("7d", now) == (now - 7 * D, now)
@@ -112,6 +139,28 @@ def test_custom_across_the_autumn_clock_change(tz_new_york):
         (ms("2026-10-31T04:00:00Z"), ms("2026-11-02T05:00:00Z"))
     assert bounds("custom", now, custom_start="2026-11-01", custom_end="2026-11-01") == \
         (ms("2026-11-01T04:00:00Z"), ms("2026-11-02T05:00:00Z"))
+
+
+@pytest.mark.parametrize("text", ["9999-12-31", "0001-01-01", "1969-12-31", "2101-01-01"])
+def test_out_of_range_custom_date_is_a_value_error(text):
+    now = ms("2026-10-22T05:00:00Z")
+    with pytest.raises(ValueError):
+        bounds("custom", now, custom_start=text, custom_end="")
+    with pytest.raises(ValueError):
+        bounds("custom", now, custom_start="", custom_end=text)
+    with pytest.raises(ValueError):
+        bounds("custom", now, custom_start="2026-10-01", custom_end=text)
+    with pytest.raises(ValueError):
+        bounds("custom", now, custom_start=text, custom_end="2026-10-20")
+
+
+def test_custom_dates_at_the_edges_of_the_supported_window(tz_new_york):
+    now = ms("2026-10-22T05:00:00Z")
+    assert bounds("custom", now, custom_start="1970-01-01", custom_end="1970-01-01") == \
+        (ms("1970-01-01T05:00:00Z"), ms("1970-01-02T05:00:00Z"))
+    assert bounds("custom", now, custom_start="2100-12-31", custom_end="") == (ms("2100-12-31T05:00:00Z"), now)
+    assert bounds("custom", now, custom_start="2026-10-01", custom_end="2100-12-31") == \
+        (ms("2026-10-01T04:00:00Z"), now)
 
 
 def test_bad_custom_date_is_an_error():
@@ -165,6 +214,56 @@ def test_bucket_start_on_clock_change_days(tz_new_york):
             assert previous is None or fine >= previous      # bucket keys never go backwards in time
             previous = fine
         assert bucket_start(after, D) == after               # the next local midnight starts a new bucket
+
+
+def test_next_bucket_start_local(tz_new_york):
+    midnight = ms("2026-10-22T04:00:00Z")
+    assert next_bucket_start(midnight, 4 * HOUR) == ms("2026-10-22T08:00:00Z")
+    assert next_bucket_start(midnight, 30 * MIN) == ms("2026-10-22T04:30:00Z")
+    assert next_bucket_start(midnight, MIN) == midnight + MIN
+    assert next_bucket_start(midnight, D) == ms("2026-10-23T04:00:00Z")
+    # The last bucket of a day is followed by the next midnight.
+    assert next_bucket_start(ms("2026-10-23T00:00:00Z"), 4 * HOUR) == ms("2026-10-23T04:00:00Z")
+    assert next_bucket_start(ms("2026-10-23T03:59:00Z"), MIN) == ms("2026-10-23T04:00:00Z")
+    # A time inside a bucket stands for that bucket.
+    assert next_bucket_start(ms("2026-10-22T07:10:00Z"), 4 * HOUR) == ms("2026-10-22T08:00:00Z")
+    assert next_bucket_start(ms("2026-10-22T07:10:00Z"), D) == ms("2026-10-23T04:00:00Z")
+
+
+def test_next_bucket_start_on_clock_change_days(tz_new_york):
+    def walk(first, stop, g):
+        keys = [first]
+        while keys[-1] < stop:
+            keys.append(next_bucket_start(keys[-1], g))
+        return keys
+
+    # Spring forward 2026-03-08: a 23-hour local day, 05:00Z to 04:00Z the next day.
+    assert walk(ms("2026-03-08T05:00:00Z"), ms("2026-03-09T04:00:00Z"), 4 * HOUR) == [
+        ms("2026-03-08T%sZ" % hhmm) for hhmm in ("05:00:00", "09:00:00", "13:00:00", "17:00:00", "21:00:00")
+    ] + [ms("2026-03-09T01:00:00Z"), ms("2026-03-09T04:00:00Z")]
+    assert walk(ms("2026-03-07T05:00:00Z"), ms("2026-03-10T04:00:00Z"), D) == [
+        ms("2026-03-07T05:00:00Z"), ms("2026-03-08T05:00:00Z"), ms("2026-03-09T04:00:00Z"), ms("2026-03-10T04:00:00Z")]
+    # Autumn back 2026-11-01: a 25-hour local day, 04:00Z to 05:00Z the next day; the last 4h bucket is cut short.
+    assert walk(ms("2026-11-01T04:00:00Z"), ms("2026-11-02T05:00:00Z"), 4 * HOUR) == [
+        ms("2026-11-01T04:00:00Z"), ms("2026-11-01T08:00:00Z"), ms("2026-11-01T12:00:00Z"),
+        ms("2026-11-01T16:00:00Z"), ms("2026-11-01T20:00:00Z"), ms("2026-11-02T00:00:00Z"),
+        ms("2026-11-02T04:00:00Z"), ms("2026-11-02T05:00:00Z")]
+    assert walk(ms("2026-10-31T04:00:00Z"), ms("2026-11-03T05:00:00Z"), D) == [
+        ms("2026-10-31T04:00:00Z"), ms("2026-11-01T04:00:00Z"), ms("2026-11-02T05:00:00Z"), ms("2026-11-03T05:00:00Z")]
+
+
+@pytest.mark.parametrize("first,stop", [("2026-03-07T05:00:00Z", "2026-03-10T04:00:00Z"),
+                                        ("2026-10-31T04:00:00Z", "2026-11-03T05:00:00Z")])
+def test_next_bucket_start_walks_exactly_the_buckets_that_hold_data(tz_new_york, first, stop):
+    first, stop = ms(first), ms(stop)
+    for g_ms in (g for _, _, g in GRANULARITIES):
+        keys = [bucket_start(first, g_ms)]
+        while keys[-1] < stop:
+            keys.append(next_bucket_start(keys[-1], g_ms))
+        assert all(b > a for a, b in zip(keys, keys[1:]))                       # strictly increasing
+        assert all(bucket_start(k, g_ms) == k for k in keys)                    # every key is a bucket start
+        scanned = sorted({bucket_start(t, g_ms) for t in range(first, stop, MIN)})
+        assert keys == scanned + [stop]                                         # none skipped, none invented
 
 
 def test_zoom_granularity():

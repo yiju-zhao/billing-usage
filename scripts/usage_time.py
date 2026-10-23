@@ -28,6 +28,10 @@ RANGE_BUCKETS = {"today": "30m", "week": "4h", "7d": "4h", "30d": "1d", "all": "
 # The narrowest window the timeline can be zoomed to.
 MIN_SPAN_MS = 30 * MINUTE_MS
 
+# Custom dates must fall in this window: usage starts after the epoch, and it keeps mktime well inside its range.
+_FIRST_DAY = date(1970, 1, 1)
+_LAST_DAY = date(2100, 12, 31)
+
 
 def cycle_start_ms(now_ms: int, day: int) -> int:
     """The latest `YYYY-MM-<day>T00:00Z` that is not after `now_ms`. `day` is 1-28, so it exists every month."""
@@ -50,12 +54,21 @@ def _local_date(t_ms: int) -> date:
     return date(local.tm_year, local.tm_mon, local.tm_mday)
 
 
+def _parse_day(text: str) -> date:
+    """A user-typed `YYYY-MM-DD`; ValueError when malformed or outside the supported window."""
+    day = date.fromisoformat(text)
+    if not _FIRST_DAY <= day <= _LAST_DAY:
+        raise ValueError("date out of range (%s to %s): %r" % (_FIRST_DAY, _LAST_DAY, text))
+    return day
+
+
 def range_bounds(key: str, now_ms: int, *, cycle_day: int, week_resets_at_ms: Optional[int],
                  custom_start: str, custom_end: str) -> Optional[Tuple[int, int]]:
     """`(from_ms, to_ms)` for a range key, `to_ms` exclusive; `None` for "week" before the reset time is known.
 
-    `custom_start` and `custom_end` are local dates as `YYYY-MM-DD` (a bad one raises ValueError). An empty
-    start means local midnight today; an empty end means now. A non-empty end day is included whole.
+    `custom_start` and `custom_end` are local dates as `YYYY-MM-DD`; one that is malformed or outside
+    1970-01-01..2100-12-31 raises ValueError. An empty start means local midnight today; an empty end means
+    now. A non-empty end day is included whole.
     """
     if key == "today":
         return _local_midnight_ms(_local_date(now_ms)), now_ms
@@ -70,17 +83,16 @@ def range_bounds(key: str, now_ms: int, *, cycle_day: int, week_resets_at_ms: Op
     if key == "week":
         if week_resets_at_ms is None:
             return None
+        # The reset time repeats every week, so the current period began at the latest
+        # `resets_at + k*7d - 7d` that is not after now, whether resets_at is ahead of now or stale.
         start = week_resets_at_ms - WEEK_MS
-        if start > now_ms:  # the reset is over a week away: step back whole weeks until start <= now
-            weeks = -(-(start - now_ms) // WEEK_MS)  # ceiling division
-            start -= weeks * WEEK_MS
-        return start, now_ms
+        return start + (now_ms - start) // WEEK_MS * WEEK_MS, now_ms
     if key == "custom":
-        start_day = date.fromisoformat(custom_start) if custom_start else _local_date(now_ms)
+        start_day = _parse_day(custom_start) if custom_start else _local_date(now_ms)
         start = _local_midnight_ms(start_day)
         if not custom_end:
             return start, now_ms
-        end = _local_midnight_ms(date.fromisoformat(custom_end) + timedelta(days=1))
+        end = _local_midnight_ms(_parse_day(custom_end) + timedelta(days=1))
         return start, min(end, now_ms)
     raise ValueError("unknown range: %r" % (key,))
 
@@ -96,6 +108,19 @@ def bucket_start(t_ms: int, g_ms: int) -> int:
     if g_ms >= DAY_MS:
         return midnight
     return midnight + (t_ms - midnight) // g_ms * g_ms
+
+
+def next_bucket_start(start_ms: int, g_ms: int) -> int:
+    """Start of the bucket after the one holding `start_ms` (normally a `bucket_start` value).
+
+    A 1-day bucket is followed by the next local midnight. A sub-day bucket is followed by `start + g_ms`, or
+    by the next local midnight when that comes first (the last bucket of a 23-hour day ends at midnight).
+    """
+    start = bucket_start(start_ms, g_ms)
+    next_midnight = _local_midnight_ms(_local_date(start) + timedelta(days=1))
+    if g_ms >= DAY_MS:
+        return next_midnight
+    return min(start + g_ms, next_midnight)
 
 
 def zoom_granularity(picked_ms: int, full_ms: int, visible_ms: int) -> int:
