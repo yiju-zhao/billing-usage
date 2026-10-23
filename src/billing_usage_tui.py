@@ -1,16 +1,13 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["textual==8.2.8"]
-# ///
 """A resident terminal UI for Claude Code usage across every device in the billing-usage devices file.
 
 Two sections, as in token-meter's sidebar: a timeline and a share table, each headed by a sentence whose words
 you can change (click, or Tab then Enter). Refreshes every 60 s without any model call; `r` refreshes now,
 `c` sets the billing-cycle start day, `q` quits. On the timeline, +/- zoom, ←/→ move the highlighted bar (pan
 once zoomed), ↑/↓ pick a legend entry, `i` shows only that segment, Esc lets go. `--once` refreshes, writes the
-status-line summary, prints one line and exits.
+status-line summary, prints one line and exits. `bu report` prints the per-day table (see billing_usage.py).
 
-    uv run --script billing_usage_tui.py [--devices FILE] [--config-dir DIR] [--timeout S] [--once]
+    bu [--devices FILE] [--config-dir DIR] [--timeout S] [--once]
+    bu report --start YYYY-MM-DD [--end YYYY-MM-DD] [--devices FILE] [--timeout S]
 """
 from __future__ import annotations
 
@@ -491,7 +488,13 @@ class UsageApp(App):
 # ---------------------------------------------------------------- entry point
 
 def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["report"]:
+        import billing_usage
+        billing_usage.main(argv[1:])
+        return 0
+    p = argparse.ArgumentParser(prog="bu", description=__doc__.splitlines()[0],
+                                epilog="bu report --start YYYY-MM-DD prints the per-day table; bu report -h for its options")
     p.add_argument("--devices", help="devices file (default: ~/.config/billing-usage/devices.json, else this machine)")
     p.add_argument("--config-dir", default=os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude")))
     p.add_argument("--timeout", type=int, default=120, help="seconds to wait for each ssh device (default: 120)")

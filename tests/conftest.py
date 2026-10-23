@@ -1,4 +1,4 @@
-"""Shared fixtures: put scripts/ on sys.path and build transcript sets."""
+"""Shared fixtures: put src/ on sys.path and build transcript sets."""
 import json
 import os
 import pathlib
@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts")
+SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
 sys.path.insert(0, os.path.abspath(SCRIPTS))
 
 

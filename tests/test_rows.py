@@ -13,7 +13,7 @@ from billing_usage import _total, fetch_device_rows, fetch_remote, summarize, su
 from conftest import assistant, write_transcript
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.abspath(os.path.join(HERE, "..", "scripts", "billing_usage.py"))
+SCRIPT = os.path.abspath(os.path.join(HERE, "..", "src", "billing_usage.py"))
 START_1008 = datetime(2026, 10, 8, tzinfo=timezone.utc)
 END_1009 = datetime(2026, 10, 9, tzinfo=timezone.utc)
 ROW_KEYS = {"t", "model", "effort", "project", "skill", "input", "output",

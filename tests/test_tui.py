@@ -470,6 +470,20 @@ def test_once_cli(tmp_path, capsys):
     assert summary["cycle_text"] == "$4" and summary["devices_ok"] == 1
 
 
+def test_report_subcommand_prints_the_per_day_table(tmp_path, capsys):
+    usage = {"input_tokens": 1_000_000, "output_tokens": 0, "cache_creation_input_tokens": 0,
+             "cache_read_input_tokens": 0}
+    write_transcript(tmp_path / "claude" / "projects" / "-p",
+                     [assistant("2026-10-08T01:00:00Z", "m1", "r1", "claude-opus-5-5", usage, cwd="/x/proj")])
+    devices = tmp_path / "devices.json"
+    devices.write_text(json.dumps({"devices": [{"name": "here", "method": "local"}]}))
+    assert main(["report", "--start", "2026-10-08", "--end", "2026-10-08", "--devices", str(devices),
+                 "--config-dir", str(tmp_path / "claude")]) == 0
+    out = capsys.readouterr().out
+    total = next(line for line in out.splitlines() if line.startswith("TOTAL"))
+    assert total.split()[1] == "1" and total.split()[-1] == "4.00"
+
+
 def test_once_cli_lists_offline_devices(tmp_path, capsys, monkeypatch):
     import billing_usage_tui
     monkeypatch.setattr(billing_usage_tui, "fetch_device_rows", failing_b)

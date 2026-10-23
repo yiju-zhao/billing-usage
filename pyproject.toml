@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "billing-usage"
+version = "0.4.0"
+description = "Claude Code token usage and list-price cost across your devices, in a terminal UI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["textual==8.2.8"]
+
+[project.scripts]
+bu = "billing_usage_tui:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+# Flat modules: billing_usage.py must stay a standalone stdlib script, because it is piped to ssh devices.
+py-modules = ["billing_usage", "billing_usage_tui", "tui_timeline", "tui_widgets", "usage_groups", "usage_store",
+              "usage_time"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

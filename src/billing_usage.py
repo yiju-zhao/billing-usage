@@ -315,7 +315,7 @@ def print_devices(devices, outcomes):
         print(_row(dev["name"], b, "ok" if result else f"UNREACHABLE: {error}"))
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--start", required=True, help="first day of the billing cycle, YYYY-MM-DD (UTC)")
     p.add_argument("--end", help="last day to include, YYYY-MM-DD (UTC); default: now")
@@ -325,7 +325,7 @@ def main():
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--json", action="store_true", help="print this machine's summary as one JSON line (used over ssh)")
     mode.add_argument("--rows", action="store_true", help="print this machine's requests, one by one, as one JSON line")
-    a = p.parse_args()
+    a = p.parse_args(argv)
 
     start, end = window(a.start, a.end)
 
