@@ -367,6 +367,8 @@ class UsageApp(App):
         """Fetch again when the choices now reach further back than the rows on hand."""
         if self._refreshing:
             return  # _refresh_done checks once the running refresh is in
+        if self._refresh_error is not None:
+            return  # the last refresh failed: the timer retries it, choices do not
         # Nothing fetched yet means the refreshes so far failed; the timer retries those, not every choice.
         if self._fetched_from is not None and fetch_start(self.state, now_ms()) < self._fetched_from:
             self.start_refresh()

@@ -547,3 +547,29 @@ def test_first_refresh_failing_does_not_refresh_on_every_choice(monkeypatch):
             await settle(app, pilot)
         assert len(calls) == 1
     run(app, body)
+
+
+
+def test_failed_earlier_start_refresh_is_not_retried_by_every_choice(monkeypatch):
+    import billing_usage_tui
+    app = UsageApp(DEVS, config_dir="x", fetch=fake_fetch)
+    calls = []
+
+    def broken(*args, **kwargs):
+        calls.append(args[1])
+        raise RuntimeError("boom")
+
+    async def body(pilot):
+        monkeypatch.setattr(billing_usage_tui, "refresh_all", broken)
+        app.post_message(SentenceBar.Changed("share", "range", "all"))  # needs an earlier start
+        await settle(app, pilot)
+        assert calls == [usage_store.ALL_TIME_START]
+        assert "刷新失败：boom" in screen_text(app)
+        for field, value in (("by", "skill"), ("device", "a"), ("by", "model")):
+            app.post_message(SentenceBar.Changed("share", field, value))
+            await settle(app, pilot)
+        assert len(calls) == 1
+        app._tick()
+        await settle(app, pilot)
+        assert len(calls) == 2
+    run(app, body)
