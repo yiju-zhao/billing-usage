@@ -1,5 +1,5 @@
-"""Widgets for the billing-usage TUI: the sentence pickers, the share table, the custom-date row, the dialogs
-and the timeline's placeholder.
+"""Widgets for the billing-usage TUI: the sentence pickers, the share table, the custom-date row and the
+dialogs. The timeline lives in tui_timeline.
 
 Text that is not data is a quiet grey; the words you can change are brighter and underlined; numbers are
 right-aligned in fixed columns. Widths are counted in terminal cells (CJK characters take two).
@@ -268,6 +268,7 @@ class SentenceBar(Horizontal):
         self._values = {name: (values or {}).get(name, options[0][0] if options else "")
                         for name, options in fields}
         self._words = {name: Word(name, id=f"{section}-{name}") for name in self._fields}
+        self._overrides: dict = {}  # field -> label shown instead of the chosen option's (the zoomed bucket)
 
     def compose(self) -> ComposeResult:
         for i, name in enumerate(self._fields):
@@ -293,7 +294,16 @@ class SentenceBar(Horizontal):
         return self._values[field]
 
     def _show(self, field: str) -> None:
-        self._words[field].update(self.label(field))
+        self._words[field].update(self._overrides.get(field) or self.label(field))
+
+    def set_override(self, field: str, label: Optional[str]) -> None:
+        """Show `label` for `field` without changing its value; None shows the chosen option again."""
+        if self._overrides.get(field) != label:
+            if label is None:
+                self._overrides.pop(field, None)
+            else:
+                self._overrides[field] = label
+            self._show(field)
 
     def set_value(self, field: str, value: str) -> None:
         self._values[field] = value
@@ -468,36 +478,3 @@ class CycleDayScreen(ModalScreen):
 
     def action_dismiss_none(self) -> None:
         self.dismiss(None)
-
-
-# ---------------------------------------------------------------- timeline (placeholder until the chart lands)
-
-class TimelineChart(Widget):
-    """The timeline area. For now it says how many requests the range holds; the stacked chart replaces it."""
-
-    DEFAULT_CSS = f"""
-    TimelineChart {{ height: 1fr; min-height: 1; padding: 0 1; color: {MUTED}; content-align: center middle; }}
-    """
-
-    def __init__(self, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.rows: List[dict] = []
-        self.slots: Optional[dict] = None
-        self.by, self.metric = "model", "cost"
-        self.picked_ms, self.range_from, self.range_to = 0, 0, 0
-        self.empty = "无数据"
-
-    def update(self, rows: List[dict], by: str, metric: str, picked_ms: int, range_from: int, range_to: int,
-               empty: str = "无数据", slots: Optional[dict] = None) -> None:
-        """`rows` are the section's (device and range already applied); `slots` is model_slots() over every
-        row, to pass on to segments() so colours do not move; `empty` is what to say when there are no rows."""
-        self.slots = slots
-        self.rows, self.by, self.metric = rows, by, metric
-        self.picked_ms, self.range_from, self.range_to = picked_ms, range_from, range_to
-        self.empty = empty
-        self.refresh()
-
-    def render(self) -> Text:
-        if not self.rows:
-            return Text(self.empty, style=MUTED)
-        return Text(f"{len(self.rows):,} 次请求", style=MUTED)

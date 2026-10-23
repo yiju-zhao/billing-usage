@@ -1,6 +1,8 @@
 """Pilot tests for the Textual app: header, sentences, share table, refresh, --once."""
 import asyncio
+import bisect
 import json
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -14,8 +16,11 @@ from billing_usage_tui import UsageApp, main  # noqa: E402
 from conftest import assistant, write_transcript  # noqa: E402
 from textual.widgets import Input, OptionList  # noqa: E402
 from rich.cells import cell_len  # noqa: E402
-from tui_widgets import SentenceBar, share_table_lines  # noqa: E402
+from tui_timeline import BAND, Legend, Plot, TimelineChart, bucket_title  # noqa: E402
+from tui_widgets import BG, SentenceBar, ShareTable, share_table_lines  # noqa: E402
 from usage_groups import GREY, aggregate  # noqa: E402
+from usage_time import GRANULARITIES  # noqa: E402
+from billing_usage_tui import granularity_label  # noqa: E402
 
 NOW = int(time.time() * 1000)
 DEVS = [{"name": "a", "method": "local"}, {"name": "b", "method": "ssh", "address": "b.example"}]
@@ -573,3 +578,283 @@ def test_failed_earlier_start_refresh_is_not_retried_by_every_choice(monkeypatch
         await settle(app, pilot)
         assert len(calls) == 2
     run(app, body)
+
+
+# ---------------------------------------------------------------- the timeline
+
+HOUR = 3_600_000
+OPUS_HIGH, OPUS_XHIGH, SONNET_HIGH = "#3987e5", "#6da7ec", "#d95926"
+BAR_GLYPHS = set("█▁▂▃▄▅▆▇")
+
+
+def chart_rows():
+    return [row(NOW - 2 * HOUR, "nasa718", 4.0), row(NOW - 2 * HOUR, "career-ops", 2.0, model="claude-sonnet-5-5"),
+            row(NOW - 30 * HOUR, "nasa718", 3.0, effort="xhigh"),
+            row(NOW - 54 * HOUR, "aps", 1.0, model="claude-sonnet-5-5")]
+
+
+def chart_fetch(dev, start, end, timeout, config_dir):
+    if dev["name"] == "a":
+        return {"rows": chart_rows(), "unpriced": []}
+    return {"rows": [row(NOW - 3 * HOUR, "aps", 1.0, model="claude-sonnet-5-5")], "unpriced": []}
+
+
+def cells_of(app, widget):
+    """(char, fg, bg) for every cell of `widget` on screen, row by row."""
+    strips = app.screen._compositor.render_strips()
+    r = widget.region
+    grid = []
+    for y in range(r.y, r.bottom):
+        line = []
+        for seg in strips[y].crop(r.x, r.right):
+            st = seg.style
+            fg = st.color.triplet.hex if st and st.color and st.color.triplet else None
+            bg = st.bgcolor.triplet.hex if st and st.bgcolor and st.bgcolor.triplet else None
+            line.extend((ch, fg, bg) for ch in seg.text)
+        grid.append(line)
+    return grid
+
+
+def widget_text(app, widget):
+    return "\n".join("".join(ch for ch, _, _ in line) for line in cells_of(app, widget))
+
+
+def bar_colours(app):
+    """The colours the bars are drawn in (the panel and highlight backgrounds left out)."""
+    out = set()
+    for line in cells_of(app, app.query_one(Plot)):
+        for ch, fg, bg in line:
+            if ch in BAR_GLYPHS:
+                out.add(fg)
+                if ch != "█" and bg:
+                    out.add(bg)
+    return out - {BG, BAND, None}
+
+
+def test_timeline_draws_stacked_bars_axis_labels_total_and_legend():
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=chart_fetch)
+
+    async def body(pilot):
+        assert bar_colours(app) == {OPUS_HIGH, OPUS_XHIGH, SONNET_HIGH}
+        text = widget_text(app, app.query_one(Plot))
+        lines = text.splitlines()
+        assert "$10" in lines[0].split() and "+/- 缩放" in lines[0]
+        assert any("┤" in ln for ln in lines) and any("└" in ln for ln in lines)
+        assert time.strftime("%m/%d", time.localtime(NOW / 1000)) in text  # the x axis is labelled in dates
+        legend = widget_text(app, app.query_one(Legend))
+        assert "■ opus-5-5 high 40%" in legend and "■ sonnet-5-5 high 30%" in legend
+        assert "■ opus-5-5 xhigh 30%" in legend
+    run(app, body)
+
+
+def test_plus_zooms_in_and_the_sentence_shows_the_finer_bucket():
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=chart_fetch)
+
+    async def body(pilot):
+        chart = app.query_one(TimelineChart)
+        axis = chart.data.axis
+        assert chart.window is None and chart.data.g == 4 * HOUR
+        await pilot.press("+")
+        await pilot.pause()
+        assert chart.window is not None
+        assert chart.window[1] - chart.window[0] < axis[1] - axis[0]
+        g = chart.data.g
+        assert g < 4 * HOUR
+        label = granularity_label(next(lb for _, lb, ms in GRANULARITIES if ms == g))
+        assert "· %s · 最近 7 天" % label in screen_text(app)
+        assert app.state["timeline"]["granularity"] == "4h"  # the choice itself is unchanged
+        await pilot.press("minus")
+        await pilot.pause()
+        assert chart.window is None and "· 每 4 小时 · 最近 7 天" in screen_text(app)
+    run(app, body)
+
+
+def test_left_after_zoom_pans_the_window():
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=chart_fetch)
+
+    async def body(pilot):
+        chart = app.query_one(TimelineChart)
+        await pilot.press("+")
+        await pilot.pause()
+        before = chart.window
+        await pilot.press("left")
+        await pilot.pause()
+        after = chart.window
+        span = before[1] - before[0]
+        assert after[1] - after[0] == span and after[0] == before[0] - span // 4
+        await pilot.press("right")
+        await pilot.pause()
+        assert chart.window == before
+        await pilot.press("shift+left")  # moves the highlight even while zoomed
+        await pilot.pause()
+        assert chart.hl_ms is not None and chart.window == before
+        app.post_message(SentenceBar.Changed("timeline", "range", "30d"))  # a new range starts over
+        await pilot.pause()
+        assert chart.window is None and chart.hl_ms is None and "· 每天 · 最近 30 天" in screen_text(app)
+    run(app, body)
+
+
+def test_isolating_a_legend_entry_leaves_only_its_colour_and_total():
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=chart_fetch)
+
+    async def body(pilot):
+        chart = app.query_one(TimelineChart)
+        await pilot.press("down")  # the first legend entry
+        await pilot.pause()
+        assert chart.legend_key == "claude-opus-5-5\thigh"
+        assert OPUS_HIGH in bar_colours(app) and SONNET_HIGH not in bar_colours(app)  # the others are dimmed
+        await pilot.press("i")
+        await pilot.pause()
+        assert chart.only == "claude-opus-5-5\thigh"
+        assert bar_colours(app) == {OPUS_HIGH}
+        top = widget_text(app, app.query_one(Plot)).splitlines()[0].split()
+        assert "$4" in top and "$10" not in top
+        await pilot.press("i")  # again: back to every segment
+        await pilot.pause()
+        assert chart.only is None and bar_colours(app) >= {OPUS_HIGH}
+        assert "$10" in widget_text(app, app.query_one(Plot)).splitlines()[0].split()
+    run(app, body)
+
+
+def test_switching_grouping_clears_only_and_a_vanished_segment_clears_it():
+    app = UsageApp(DEVS, config_dir="x", fetch=chart_fetch)
+
+    async def body(pilot):
+        chart = app.query_one(TimelineChart)
+        await pilot.press("down", "i")
+        await pilot.pause()
+        assert chart.only == "claude-opus-5-5\thigh"
+        app.post_message(SentenceBar.Changed("timeline", "by", "project"))
+        await pilot.pause()
+        assert chart.only is None and chart.legend_key is None
+        await pilot.press("down", "i")
+        await pilot.pause()
+        assert chart.only == "nasa718"
+        app.post_message(SentenceBar.Changed("timeline", "device", "b"))  # b never worked on nasa718
+        await pilot.pause()
+        assert chart.only is None
+        assert bar_colours(app)  # the chart is drawn again
+    run(app, body)
+
+
+def detail_lines_on(text):
+    lines = text.splitlines()
+    opus = [i for i, ln in enumerate(lines) if re.search(r"opus-5-5 high\s+\$4\s+67%", ln)]
+    sonnet = [i for i, ln in enumerate(lines) if re.search(r"sonnet-5-5 high\s+\$2\s+33%", ln)]
+    total = [i for i, ln in enumerate(lines) if re.search(r"合计\s+\$6\s+│", ln)]  # no share before the border
+    return opus, sonnet, total
+
+
+async def highlight_bucket(pilot, chart, t_ms):
+    """Highlight the bucket holding `t_ms` with the keyboard: the first ← lights the latest bar."""
+    starts = chart.data.starts
+    target = bisect.bisect_right(starts, t_ms) - 1
+    for _ in range(len(starts) - target):
+        await pilot.press("left")
+    await pilot.pause()
+    return target
+
+
+def test_highlighted_bar_lists_its_segments_largest_first_and_a_total_without_share():
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=chart_fetch)
+
+    async def body(pilot):
+        chart = app.query_one(TimelineChart)
+        assert chart.hl_ms is None and "合计" not in screen_text(app)  # nothing highlighted at first
+        starts = chart.data.starts
+        target = await highlight_bucket(pilot, chart, NOW - 2 * HOUR)
+        assert chart.hl_index() == target
+        text = screen_text(app)
+        opus, sonnet, total = detail_lines_on(text)
+        assert opus and sonnet and total and opus[0] < sonnet[0] < total[0]
+        assert bucket_title(starts[target], chart.data.ends[target], chart.data.g) in text
+        await pilot.press("left")
+        await pilot.pause()
+        assert chart.hl_index() == max(0, target - 1)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert chart.hl_ms is None and "合计" not in screen_text(app)
+    run(app, body)
+
+
+def test_detail_box_sits_inside_the_plot_beside_the_bar_on_a_narrow_screen():
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=chart_fetch)
+
+    async def body(pilot):
+        chart = app.query_one(TimelineChart)
+        await highlight_bucket(pilot, chart, NOW - 2 * HOUR)
+        plot = app.query_one(Plot)
+        text = widget_text(app, plot)
+        opus, sonnet, total = detail_lines_on(text)
+        assert opus and sonnet and total and opus[0] < sonnet[0] < total[0]
+        assert "╭" in text and "╰" in text
+        assert app.query_one(ShareTable).region.height >= 2
+        hit = plot.hit
+        lines = text.splitlines()
+        x0 = hit.gutter + (chart.hl_index() - hit.first) * hit.slot
+        box_cols = [ln.index("╭") for ln in lines if "╭" in ln]
+        assert box_cols and (box_cols[0] > x0 or box_cols[0] + 20 < x0)  # beside the bar, not over it
+    run(app, body, size=(70, 24))
+
+
+def test_hover_highlights_a_bar_and_clicking_a_legend_entry_picks_it():
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=chart_fetch)
+
+    async def body(pilot):
+        chart = app.query_one(TimelineChart)
+        plot = app.query_one(Plot)
+        hit = plot.hit
+        await pilot.hover(Plot, offset=(hit.gutter + hit.slot - 1, hit.top))
+        await pilot.pause()
+        assert chart.hl_ms is not None and chart.hl_index() == hit.first
+        legend = app.query_one(Legend)
+        await pilot.hover(Legend, offset=(0, 0))
+        await pilot.pause()
+        assert chart.hl_ms is None  # a highlight that followed the mouse goes with it
+        y, x0, _, key = legend.hits[1]
+        await pilot.click(Legend, offset=(x0 + 1, y))
+        await pilot.pause()
+        assert chart.legend_key == key
+        await pilot.click(Legend, offset=(x0 + 1, y))
+        await pilot.pause()
+        assert chart.legend_key is None
+    run(app, body)
+
+
+def test_mouse_wheel_zooms_around_the_bar_under_the_mouse():
+    from textual import events
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=chart_fetch)
+
+    async def body(pilot):
+        plot, chart = app.query_one(Plot), app.query_one(TimelineChart)
+        hit = plot.hit
+        x, y = hit.gutter + 2 * hit.slot, hit.top + 1
+        under = chart.data.starts[hit.first + 2]
+        plot.post_message(events.MouseScrollUp(plot, x, y, 0, 1, 0, False, False, False, screen_x=x, screen_y=y))
+        await pilot.pause()
+        await pilot.pause()
+        assert chart.window is not None and chart.window[0] <= under < chart.window[1]
+        assert chart.data.starts[chart.hl_index()] >= under
+        plot.post_message(events.MouseScrollDown(plot, x, y, 0, -1, 0, False, False, False, screen_x=x, screen_y=y))
+        await pilot.pause()
+        await pilot.pause()
+        assert chart.window is None
+    run(app, body)
+
+
+def test_100x30_keeps_chart_legend_detail_and_share_table_on_screen():
+    app = UsageApp(DEVS[:1], config_dir="x", fetch=chart_fetch)
+
+    async def body(pilot):
+        await pilot.press("left")
+        await pilot.pause()
+        text = screen_text(app)
+        assert bar_colours(app)
+        assert "■ opus-5-5 high" in text and "合计" in text
+        table = app.query_one(ShareTable)
+        assert table.region.height >= 4 and table.region.bottom <= 30
+        assert "项目" in text and re.search(r"nasa718\s+\S+\s+70%", text)
+        assert all(cell_len(ln) <= 100 for ln in text.splitlines())
+        title = text.splitlines()[0]
+        assert "今日" in title and "r 刷新" in title
+    run(app, body, size=(100, 30))

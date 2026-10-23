@@ -6,8 +6,9 @@
 
 Two sections, as in token-meter's sidebar: a timeline and a share table, each headed by a sentence whose words
 you can change (click, or Tab then Enter). Refreshes every 60 s without any model call; `r` refreshes now,
-`c` sets the billing-cycle start day, `q` quits. `--once` refreshes, writes the status-line summary, prints
-one line and exits.
+`c` sets the billing-cycle start day, `q` quits. On the timeline, +/- zoom, ←/→ move the highlighted bar (pan
+once zoomed), ↑/↓ pick a legend entry, `i` shows only that segment, Esc lets go. `--once` refreshes, writes the
+status-line summary, prints one line and exits.
 
     uv run --script billing_usage_tui.py [--devices FILE] [--config-dir DIR] [--timeout S] [--once]
 """
@@ -82,10 +83,14 @@ from textual.binding import Binding  # noqa: E402
 from textual.containers import Horizontal  # noqa: E402
 from textual.widgets import Rule, Static  # noqa: E402
 
+from tui_timeline import TimelineChart  # noqa: E402
 from tui_widgets import (ALERT, BG, BRIGHT, MUTED, RULE, TEXT, WARN, CycleDayScreen, DateRange,  # noqa: E402
-                         SentenceBar, ShareTable, TimelineChart, fmt_metric)
+                         SentenceBar, ShareTable, fmt_metric)
 
 SECTIONS = ("timeline", "share")
+# Timeline choices that start the chart over: whole axis, no highlighted bar, no legend entry or `only`. A new
+# bucket size keeps the legend entry and `only`.
+RESETS_VIEW = ("range", "by", "metric", "granularity")
 
 
 class UsageApp(App):
@@ -96,6 +101,16 @@ class UsageApp(App):
         Binding("r", "refresh_now", "刷新", show=False),
         Binding("q", "quit", "退出", show=False),
         Binding("c", "cycle_day", "周期", show=False),
+        Binding("plus,equals_sign", "chart('zoom', 0.5)", "放大", show=False),
+        Binding("minus", "chart('zoom', 2.0)", "缩小", show=False),
+        Binding("left", "chart('pan_or_move', -1)", "左", show=False),
+        Binding("right", "chart('pan_or_move', 1)", "右", show=False),
+        Binding("shift+left", "chart('move', -1)", "上一根", show=False),
+        Binding("shift+right", "chart('move', 1)", "下一根", show=False),
+        Binding("up", "chart('step_legend', -1)", "上一段", show=False),
+        Binding("down", "chart('step_legend', 1)", "下一段", show=False),
+        Binding("i", "chart('isolate')", "只看此段", show=False),
+        Binding("escape", "chart('clear')", "取消", show=False),
     ]
     CSS = f"""
     Screen {{ background: {BG}; color: {TEXT}; layout: vertical; }}
@@ -363,6 +378,20 @@ class UsageApp(App):
     def action_refresh_now(self) -> None:
         self.start_refresh()
 
+    # ------------------------------------------------------------ timeline keys
+
+    def action_chart(self, method: str, *args) -> None:
+        if len(self.screen_stack) > 1:  # a dropdown or dialog is open
+            return
+        getattr(self.query_one(TimelineChart), method)(*args)
+
+    def on_timeline_chart_view_changed(self, message: TimelineChart.ViewChanged) -> None:
+        """While zoomed, the sentence names the bucket size drawn; the choice itself stays as it was."""
+        bar = self.query_one("#timeline-sentence", SentenceBar)
+        picked = self.state["timeline"]["granularity"]
+        label = next((lb for k, lb, ms in GRANULARITIES if ms == message.g_ms and k != picked), None)
+        bar.set_override("granularity", granularity_label(label) if message.zoomed and label else None)
+
     def _refetch_if_needed(self) -> None:
         """Fetch again when the choices now reach further back than the rows on hand."""
         if self._refreshing:
@@ -412,6 +441,8 @@ class UsageApp(App):
                 bar.set_value("granularity", s["granularity"])
         if not self._pending_custom[section] or field != "range":
             s[field] = value
+        if section == "timeline" and field in RESETS_VIEW:
+            self.query_one(TimelineChart).reset_view(keep_only=field == "granularity")
         self._save()
         self.render_all()
         self._refetch_if_needed()
@@ -426,6 +457,8 @@ class UsageApp(App):
         self._pending_custom[section] = False
         self.state[section]["range"] = "custom"
         self.state[section]["start"], self.state[section]["end"] = message.start, message.end
+        if section == "timeline":
+            self.query_one(TimelineChart).reset_view()
         self._save()
         self.render_all()
         self._refetch_if_needed()
